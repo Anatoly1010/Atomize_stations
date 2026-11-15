@@ -1,0 +1,893 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+from atomize.general_modules.gui_style import REFINED_STYLES, style_file_dialog
+import datetime
+import struct
+import socket
+import configparser
+from math import exp, sqrt
+from threading import Thread
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QLabel, QDoubleSpinBox, QSpinBox, QComboBox, QPushButton, QTextEdit, QGridLayout, QFrame
+from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import QEvent, Qt, QTimer
+import atomize.general_modules.general_functions as general
+import atomize.device_modules.ECC_15K as ecc
+import atomize.control_center.bridge_param as bridge_param
+
+_LOCK_POLL_MS = 1000
+
+class MainWindow(QMainWindow):
+    """
+    A main window class
+    """
+    def __init__(self, *args, **kwargs):
+        """
+        A function for connecting actions and creating a main window
+        """
+        super(MainWindow, self).__init__(*args, **kwargs)
+        
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # SOCK_DGRAM is UDP
+        # The bridge talks UDP, so a powered-off bridge simply never replies and a
+        # bare recvfrom() blocks forever -- which froze the whole control center on
+        # launch (initialize() runs in __init__). A timeout turns that infinite
+        # wait into a fast, recoverable error; every receive goes through _recv().
+        self.sock.settimeout( 1.0 )
+        self._connected = True
+
+        # configuration data
+        path_to_main = os.path.dirname(os.path.abspath(__file__))        
+        path_config_file = os.path.join(path_to_main,'mw_config.ini')
+        config = configparser.ConfigParser()
+        config.read(path_config_file)
+
+        ###self.ecc15k = ecc.ECC_15K()
+
+        self.UDP_IP = str(config['DEFAULT']['UDP_IP'])
+        self.UDP_PORT = int(config['DEFAULT']['UDP_PORT'])
+
+        self.design()
+
+        self.label_timer = QTimer(self)
+        self.label_timer.setSingleShot(True)
+        self.label_timer.timeout.connect(lambda: self.label_1.setStyleSheet(REFINED_STYLES['LABEL_STYLE']))
+
+        self.curr_dB = 60
+        self.prev_dB = 60
+        self.p1 = 'None'
+
+
+        try:
+            path_to_main_status = os.path.dirname(os.path.abspath(__file__))
+            self.path_status_file = os.path.join(path_to_main_status, '..', 'control_center/bridge.param')
+        except FileNotFoundError:
+            pass
+
+        #self.synt()
+        # Defence-in-depth: never let bridge init abort the constructor, or the
+        # window would never appear. _recv() already returns None instead of
+        # blocking when the bridge is off; this catches anything else so the
+        # control center still opens and the user can power the bridge and retry.
+        self.lock_banner = False
+        if bridge_param.is_locked():
+            self._sync_from_file()
+            self.apply_lock_state(True)
+        else:
+            try:
+                self.initialize()
+            except Exception as e:
+                general.message('MW bridge initialization skipped: %s' % e)
+
+        self.lock_timer = QTimer(self)
+        self.lock_timer.timeout.connect(self.refresh_lock_state)
+        self.lock_timer.start(_LOCK_POLL_MS)
+        #self.telemetry()
+
+        ###power2 = int( self.Synt2_power.value() )
+        ###freq2 = int( self.Synt2.value() )
+        
+        ###self.ecc15k.synthetizer_frequency(f"{freq2} MHz")
+        ###self.ecc15k.synthetizer_power(power2)
+        
+        #self.telemetry_text.setStyleSheet("QPlainTextEdit { color : rgb(211, 194, 78); }")
+
+    def design(self):
+
+        self.setObjectName("MainWindow")
+        self.setWindowTitle("Pulsed Bridge Control")
+        self.setStyleSheet(REFINED_STYLES['WINDOW_STYLE'])
+
+        path_to_main = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(path_to_main, 'gui/icon_mw.ico')
+        self.setWindowIcon( QIcon(icon_path) )
+
+        centralwidget = QWidget(self)
+        self.setCentralWidget(centralwidget)
+
+        gridLayout = QGridLayout()
+        gridLayout.setContentsMargins(15, 10, 10, 10)
+        gridLayout.setVerticalSpacing(4)
+        gridLayout.setHorizontalSpacing(20)
+
+        centralwidget.setLayout(gridLayout)
+
+
+        # ---- Labels & Inputs ----
+        labels = [("Rotary Vane", "label_1"), ("Attenuator RECT", "label_2"), ("Attenuator AWG", "label_3"), ("Pulse Phase", "label_4"), ("Signal Phase", "label_5"), ("Video Attenuation 1", "label_6"), ("Video Attenuation 2", "label_7"), ("Source 1 Frequency", "label_8"), ("Source 2 Frequency", "label_9"), ("Source 2 State", "label_10"), ("Source 2 Power", "label_11"), ("Cut-Off Frequency", "label_12")]
+
+        for name, attr_name in labels:
+            lbl = QLabel(name)
+            lbl.setFixedSize(190, 26)
+            setattr(self, attr_name, lbl)
+            lbl.setStyleSheet(REFINED_STYLES['LABEL_STYLE'])
+
+
+        # ---- Boxes ----
+        double_boxes = [(QDoubleSpinBox, "Rot_vane", "", self.rot_vane, 0, 60, 60, 0.1, 1, " dB"),
+                      (QDoubleSpinBox, "Att1_prd", "", self.att1_prd, 0, 31.5, 16, 0.5, 1, " dB"),
+                      (QDoubleSpinBox, "Att2_prd", "", self.att2_prd, 0, 31.5, 16, 0.5, 1, " dB"),
+                      (QDoubleSpinBox, "Fv_ctrl", "", self.fv_ctrl, -5.625, 360, 0, 5.625, 3, " deg"),
+                      (QDoubleSpinBox, "Fv_prm", "", self.fv_prm, -5.625, 360, 0, 5.625, 3, " deg"),
+                      (QSpinBox, "Att1_prm", "", self.att1_prm, 0, 30, 0, 2, 0, " dB"),
+                      (QDoubleSpinBox, "Att2_prm", "", self.att2_prm, 0, 31.5, 0, 0.5, 1, " dB"),
+                      (QSpinBox, "Synt", "", self.synt, 7000, 12000, 9700, 1, 0, " MHz"),
+                      (QSpinBox, "Synt2", "", self.synt2, 800, 12000, 1000, 1, 0, " MHz"),
+                      (QSpinBox, "Synt2_power", "", self.synt2_power, 0, 31, 15, 1, 0, "")
+                        ]
+
+
+        for widget_class, attr_name, par_name, func, v_min, v_max, cur_val, v_step, dec, suf in double_boxes:
+            spin_box = widget_class()
+            if isinstance(spin_box, QDoubleSpinBox):
+                spin_box.setRange(v_min, v_max)
+                spin_box.setStyleSheet(REFINED_STYLES['COMPACT_FIELD_STYLE'])
+            else:
+                spin_box.setRange(int(v_min), int(v_max))
+                spin_box.setStyleSheet(REFINED_STYLES['COMPACT_FIELD_STYLE'])
+            spin_box.setSingleStep(v_step)
+            spin_box.setValue(cur_val)
+            if isinstance(spin_box, QDoubleSpinBox):
+                spin_box.setDecimals(dec)
+            spin_box.setSuffix(suf)
+            spin_box.valueChanged.connect(func)
+            spin_box.setFixedSize(130, 26)
+            spin_box.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.PlusMinus)
+            spin_box.setKeyboardTracking( False )
+            spin_box.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+
+            setattr(self, attr_name, spin_box)
+
+            if attr_name in ["Att1_prd", "Att2_prd", "Fv_ctrl", "Fv_prm", "Att1_prm", "Att2_prm"]:
+                spin_box.lineEdit().setReadOnly( True )
+
+        power2 = int( self.Synt2_power.value() )
+        freq2 = int( self.Synt2.value() )
+
+        # ---- Combo boxes----
+        combo_boxes = [("Off", "Synt2_state", "", self.synt2_state, 
+                        [
+                        "Off", "On"
+                        ]),
+                      ("300 MHz", "Cuttoff_box", "", self.cutoff_changed, 
+                        [
+                        "30 MHz", "105 MHz", "300 MHz"
+                        ])
+                      ]
+
+
+        for cur_text, attr_name, par_name, func, item in combo_boxes:
+            combo = QComboBox()
+            setattr(self, attr_name, combo)
+            combo.currentIndexChanged.connect(func)
+            combo.addItems(item)
+            combo.setCurrentText(cur_text)
+            combo.setFixedSize(130, 26)
+            combo.setStyleSheet(REFINED_STYLES['COMBO_STYLE'])
+
+
+        # ---- Buttons ----
+        buttons = [("Reset", "button_initialize", self.initialize),
+                   ("Telemetry", "button_telemetry", self.telemetry),
+                   ("Exit", "button_off", self.turn_off) ]
+
+        for name, attr_name, func in buttons:
+            btn = QPushButton(name)
+            btn.setFixedSize(140, 40)
+            btn.clicked.connect(func)
+            btn.setStyleSheet(REFINED_STYLES['BUTTON_STYLE'])
+            setattr(self, attr_name, btn)
+
+
+        # ---- Separators ----
+        def hline():
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setFrameShadow(QFrame.Shadow.Sunken)
+            line.setLineWidth(2)
+            return line
+
+
+        # ---- Layout placement ----
+        gridLayout.addWidget(self.label_1, 0, 0)
+        gridLayout.addWidget(self.Rot_vane, 0, 1)
+
+        gridLayout.addWidget(hline(), 1, 0, 1, 2)
+
+        gridLayout.addWidget(self.label_2, 2, 0)
+        gridLayout.addWidget(self.Att1_prd, 2, 1)
+        gridLayout.addWidget(self.label_3, 3, 0)
+        gridLayout.addWidget(self.Att2_prd, 3, 1)
+
+        gridLayout.addWidget(hline(), 4, 0, 1, 2)
+
+        gridLayout.addWidget(self.label_4, 5, 0)
+        gridLayout.addWidget(self.Fv_ctrl, 5, 1)
+        gridLayout.addWidget(self.label_5, 6, 0)
+        gridLayout.addWidget(self.Fv_prm, 6, 1)
+
+        gridLayout.addWidget(hline(), 7, 0, 1, 2)
+
+        gridLayout.addWidget(self.label_6, 8, 0)
+        gridLayout.addWidget(self.Att1_prm, 8, 1)
+        gridLayout.addWidget(self.label_7, 9, 0)
+        gridLayout.addWidget(self.Att2_prm, 9, 1)
+
+        gridLayout.addWidget(hline(), 10, 0, 1, 2)
+
+        gridLayout.addWidget(self.label_8, 11, 0)
+        gridLayout.addWidget(self.Synt, 11, 1)
+
+        gridLayout.addWidget(hline(), 12, 0, 1, 2)
+
+        gridLayout.addWidget(self.label_9, 13, 0)
+        gridLayout.addWidget(self.Synt2, 13, 1)
+        gridLayout.addWidget(self.label_10, 14, 0)
+        gridLayout.addWidget(self.Synt2_state, 14, 1)
+        gridLayout.addWidget(self.label_11, 15, 0)
+        gridLayout.addWidget(self.Synt2_power, 15, 1)
+
+        gridLayout.addWidget(hline(), 16, 0, 1, 2)
+
+        gridLayout.addWidget(self.label_12, 17, 0)
+        gridLayout.addWidget(self.Cuttoff_box, 17, 1)
+
+        gridLayout.addWidget(hline(), 18, 0, 1, 2)
+
+        gridLayout.addWidget(self.button_initialize, 19, 0)
+        gridLayout.addWidget(self.button_telemetry, 20, 0)
+        gridLayout.addWidget(self.button_off, 21, 0)
+
+        self.label_lock = QLabel("")
+        self.label_lock.setMinimumWidth(320)
+        self.label_lock.setWordWrap(True)
+        self.label_lock.setStyleSheet(REFINED_STYLES['HINT_STYLE'])
+        self.label_lock.setVisible(False)
+        gridLayout.addWidget(self.label_lock, 22, 0, 1, 2)
+
+        gridLayout.setRowStretch(23, 2)
+        gridLayout.setColumnStretch(23, 2)
+
+    # ------------------------------------------------------------ bridge lock
+    def _setters(self):
+        return (self.Rot_vane, self.Att1_prd, self.Att2_prd, self.Fv_ctrl, self.Fv_prm,
+                self.Att1_prm, self.Att2_prm, self.Synt, self.Synt2, self.Synt2_state,
+                self.Synt2_power, self.Cuttoff_box, self.button_initialize)
+
+    def _show_from_file(self):
+        """Display the published frequency and RV without sending commands."""
+        for box, value in ((self.Synt, bridge_param.current_frequency(self.Synt.value())),
+                           (self.Rot_vane, bridge_param.current_vane_db(self.curr_dB))):
+            box.blockSignals(True)
+            box.setValue(value)
+            box.blockSignals(False)
+
+    def _sync_from_file(self):
+        """Adopt the published RV as this window's own position tracking."""
+        self._show_from_file()
+        self.curr_dB = round(float(self.Rot_vane.value()), 1)
+        self.prev_dB = self.curr_dB
+
+    def refresh_lock_state(self):
+        locked = bridge_param.is_locked()
+        if locked:
+            self._show_from_file()
+        elif self.lock_banner:
+            self._sync_from_file()
+        self.apply_lock_state(locked)
+
+    def apply_lock_state(self, locked):
+        if locked == self.lock_banner:
+            return
+        self.lock_banner = locked
+        for widget in self._setters():
+            widget.setEnabled(not locked)
+        self.label_lock.setVisible(locked)
+        if locked:
+            source = bridge_param.lock_source() or 'experiment'
+            self.label_lock.setText("Bridge control locked (%s running)" % source.replace('_', ' '))
+        else:
+            self.label_lock.setText("")
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.ActivationChange:
+            if self.isActiveWindow():
+                self.on_window_focused()
+        super().changeEvent(event)
+
+    def on_window_focused(self):
+        self.Synt.blockSignals(True)
+        self.read_no_set_freq()
+        self.Synt.setValue(self.freq_file)
+        self.Synt.blockSignals(False)
+
+    def read_no_set_freq(self):
+        try:
+            with open(self.path_status_file, 'r', encoding='utf-8') as file:
+                for line in file:
+                    if line.startswith('Frequency:'):
+                        raw_answer = line.split(':', 1)[1].strip()
+                        break
+            self.freq_file = int( raw_answer )
+        except FileNotFoundError:
+            pass
+
+    def synt2(self):
+        freq2 = int( self.Synt2.value() )
+        ###self.ecc15k.synthetizer_frequency(f"{freq2} MHz")
+        #self.telemetry_text.appendPlainText( f'Synt2 Freq: {self.ecc15k.synthetizer_frequency().split(" ")[0]}')
+    
+    def synt2_power(self):
+        power2 = int( self.Synt2_power.value() )
+        ###self.ecc15k.synthetizer_power(power2)
+        #self.telemetry_text.appendPlainText( f'Synt2 Power Level: {self.ecc15k.synthetizer_power()}')
+
+    def synt2_state(self):
+        txt = str( self.Synt2_state.currentText() )
+        ###self.ecc15k.synthetizer_state(txt)
+        #self.telemetry_text.appendPlainText( f'Synt2 State: {self.ecc15k.synthetizer_state()}')
+
+    def closeEvent(self, event):
+        event.ignore()
+        try:
+            self.initialize_at_exit()
+        except Exception:
+            pass
+        self.sock.close()
+        
+        try:
+            self.p1.join()
+        except ( AttributeError, NameError, TypeError ):
+            pass
+
+        sys.exit()
+
+    def quit(self):
+        """
+        A function to quit the programm
+        """
+        try:
+            self.initialize_at_exit()
+        except Exception:
+            pass
+
+        try:
+            self.p1.join()
+        except ( AttributeError, NameError, TypeError ):
+            pass
+
+        #sock.shutdown(socket.SHUT_RDWR)
+        self.sock.close()
+        sys.exit()
+
+    def _recv(self, nbytes):
+        """
+        Receive a reply from the bridge, tolerating a powered-off / unreachable
+        bridge. Returns the raw bytes, or None if the bridge did not answer
+        within the socket timeout. Callers that parse the reply must guard for
+        None. This is what keeps a dead bridge from freezing the GUI (the old
+        bare recvfrom() blocked forever) or aborting the Qt event loop with an
+        unhandled exception in a slot. The connect/disconnect transition is
+        reported once via general.message so the log isn't spammed.
+        """
+        try:
+            data_raw, addr = self.sock.recvfrom( nbytes )
+            if not self._connected:
+                self._connected = True
+                general.message('MW bridge is responding again.')
+            return data_raw
+        except ( socket.timeout, OSError ) as e:
+            if self._connected:
+                self._connected = False
+                general.message('MW bridge is not responding (is it powered on '
+                    'and reachable?). Controls will have no effect until it is back.')
+            return None
+
+    def att1_prd(self):
+        """
+        A function to send a value to the attenuator 1 in the PRD channel
+        """
+
+        param = self.Att1_prd.value()
+        temp = 2*param
+        MESSAGE = b'\x15' + b'\x01' + struct.pack(">B", int(temp))
+        # all variants give the same result. Struct.pack is the fastest
+        #print( (int(temp)).to_bytes(1, byteorder='big') )
+        #print( struct.pack(">B", int(temp)) )
+        
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        # get attenuation
+        MESSAGE = b'\x1f' + b'\x01' + b'\x00'
+
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        #self.telemetry_text.appendPlainText( 'Att. RECT: ' + str(data_raw[2] / 2) + ' dB')
+
+    def att2_prd(self):
+        """
+        A function to send a value to the attenuator 2 in the PRD channel
+        """
+
+        param = self.Att2_prd.value()
+        temp = 2*param
+        MESSAGE = b'\x16' + b'\x01' + struct.pack(">B", int(temp))
+        
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        # get attenuation
+        MESSAGE = b'\x20' + b'\x01' + b'\x00'
+
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        #self.telemetry_text.appendPlainText( 'Att. AWG: ' + str(data_raw[2]/2) + ' dB')
+
+    def fv_ctrl(self):
+        """
+        A function to send a value to the phase shifter in the CTRL channel
+        """
+
+        param = self.Fv_ctrl.value()
+        
+        # cycling
+        if param == 360:
+            self.Fv_ctrl.setValue(0.0)
+            param = self.Fv_ctrl.value()
+        else:
+            pass
+
+        if param == -5.625:
+            self.Fv_ctrl.setValue(360.0 - 5.625)
+            param = self.Fv_ctrl.value()
+        else:
+            pass
+
+        temp = param/5.625
+        MESSAGE = b'\x17' + b'\x01' + struct.pack(">B", int(temp))
+        
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        # get phase
+        MESSAGE = b'\x21' + b'\x01' + b'\x00'
+
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        #self.telemetry_text.appendPlainText( 'Test Phase: ' + str(data_raw[2]*5.625) + ' deg')
+
+    def fv_prm(self):
+        """
+        A function to send a value to the phase shifter in the PRM channel
+        """
+
+        param = self.Fv_prm.value()
+        
+        # cycling
+        if param == 360:
+            self.Fv_prm.setValue(0.0)
+            param = self.Fv_prm.value()
+        else:
+            pass
+
+        if param == -5.625:
+            self.Fv_prm.setValue(360.0 - 5.625)
+            param = self.Fv_prm.value()
+        else:
+            pass
+
+        temp = param/5.625
+        MESSAGE = b'\x19' + b'\x01' + struct.pack(">B", int(temp))
+        
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        # get phase
+        MESSAGE = b'\x23' + b'\x01' + b'\x00'
+
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        #self.telemetry_text.appendPlainText( 'Phase: ' + str(data_raw[2]*5.625) + ' deg')
+
+    def att1_prm(self):
+        """
+        A function to send a value to the attenuator 1 in the PRM channel
+        """
+
+        param = self.Att1_prm.value()
+        temp = param/2
+        MESSAGE = b'\x1c' + b'\x01' + struct.pack(">B", int(temp))
+        
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        # get attenuation
+        MESSAGE = b'\x26' + b'\x01' + b'\x00'
+
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        #self.telemetry_text.appendPlainText( 'Video Att. 1: ' + str(data_raw[2]*2) + ' dB')
+
+    def att2_prm(self):
+        """
+        A function to send a value to the attenuator 2 in the PRM channel
+        """
+
+        param = self.Att2_prm.value()
+        temp = 2*param
+        MESSAGE = b'\x1a' + b'\x01' + struct.pack(">B", int(temp))
+        
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        # get amplification
+        MESSAGE = b'\x24' + b'\x01' + b'\x00'
+
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        #self.telemetry_text.appendPlainText( 'Video Att. 2: ' + str(data_raw[2]/2) + ' dB')
+
+    def cutoff_changed(self):
+        """
+        A function to change the bandwidth of the video amplifier
+        """
+        if bridge_param.is_locked():
+            return
+        txt = str( self.Cuttoff_box.currentText() )
+
+        if txt == '300 MHz':
+            MESSAGE = b'\x1b' + b'\x01' + b'\x02'
+
+            self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+            data_raw = self._recv(3)
+
+            # get cutt-off
+            MESSAGE = b'\x25' + b'\x01' + b'\x00'
+
+            self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+            data_raw = self._recv(3)
+
+            if data_raw is not None:
+                if data_raw[2] == 0:
+                    freq = 30
+                elif data_raw[2] == 1:
+                    freq = 105
+                elif data_raw[2] == 2:
+                    freq = 300
+
+            #self.telemetry_text.appendPlainText( f'Cut-off: {freq} MHz')
+        
+        elif txt == '105 MHz':
+            MESSAGE = b'\x1b' + b'\x01' + b'\x01'
+
+            self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+            data_raw = self._recv(3)
+
+            # get cutt-off
+            MESSAGE = b'\x25' + b'\x01' + b'\x00'
+
+            self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+            data_raw = self._recv(3)
+
+            if data_raw is not None:
+                if data_raw[2] == 0:
+                    freq = 30
+                elif data_raw[2] == 1:
+                    freq = 105
+                elif data_raw[2] == 2:
+                    freq = 300
+
+            #self.telemetry_text.appendPlainText( f'Cut-off: {freq} MHz')
+        
+        elif txt == '30 MHz':
+            MESSAGE = b'\x1b' + b'\x01' + b'\x00'
+
+            self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+            data_raw = self._recv(3)
+
+            # get cutt-off
+            MESSAGE = b'\x25' + b'\x01' + b'\x00'
+
+            self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+            data_raw = self._recv(3)
+
+            if data_raw is not None:
+                if data_raw[2] == 0:
+                    freq = 30
+                elif data_raw[2] == 1:
+                    freq = 105
+                elif data_raw[2] == 2:
+                    freq = 300
+
+            #self.telemetry_text.appendPlainText(f'Cut-off: {freq} MHz')
+
+    def synt(self):
+        """
+        A function to change the frequency
+        """
+        if bridge_param.is_locked():
+            self._show_from_file()
+            return
+
+        param = self.Synt.value()
+        temp = str(param)
+        if len( temp ) == 4:
+            temp = '0' + temp
+        elif len( temp ) == 5:
+            temp = temp
+
+        MESSAGE = b'\x04' + b'\x08' + b'\x00' + b'\x00' + b'\x00' + temp.encode()
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(10)
+
+
+        # get frequency
+        MESSAGE = b'\x1e' + b'\x08' + (0).to_bytes(8, byteorder='big')
+
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(10)
+
+        if data_raw is None:
+            return
+
+        if chr(data_raw[4]) == '1':
+            state = 'ON'
+        elif chr(data_raw[4]) == '0':
+            state = 'OFF'
+
+        if chr(data_raw[5]) == '0':
+            freq = chr(data_raw[6]) + chr(data_raw[7])\
+                + chr(data_raw[8]) + chr(data_raw[9])
+        else:
+            freq = chr(data_raw[5]) + chr(data_raw[6]) + chr(data_raw[7])\
+                + chr(data_raw[8]) + chr(data_raw[9])
+
+        try:
+            with open(self.path_status_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            with open(self.path_status_file, 'w', encoding='utf-8') as f:
+                for line in lines:
+                    if line.startswith('Frequency:'):
+                        f.write(f'Frequency:  {freq}\n')
+                    else:
+                        f.write(line)
+        except FileNotFoundError:
+            pass
+
+        #self.telemetry_text.appendPlainText( 'Frequency: ' + freq )
+
+    def show_vane_moving(self, ms):
+        # painted here because the window is busy waiting for the bridge reply while the vane turns
+        self.label_1.setStyleSheet("QLabel { color : rgb(255, 0, 0); font-weight: bold; }")
+        self.label_1.repaint()
+        self.label_timer.start(int(ms))
+    
+    def pause_and_label_exit(self, time):
+        general.wait( time )
+
+    def rot_vane(self):
+        """
+        A function to send a value to the rotary vane attenuator
+        """
+        if bridge_param.is_locked():
+            self._show_from_file()
+            return
+        param = self.Rot_vane.value()
+        self.curr_dB = round( float( param ), 1 )
+        step = int( self.calibration( self.curr_dB ) ) - int( self.calibration( self.prev_dB ) )
+
+        try:
+            self.p1.join()
+        except ( AttributeError, NameError, TypeError ):
+            pass
+
+        if bridge_param.is_locked():
+            self._show_from_file()
+            return
+
+        MESSAGE = b'\x0e' + b'\x04' + b'\x01' + b'\x02' + ( step ).to_bytes( 2, byteorder = 'big', signed = True )
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        # 6 bytes to recieve
+
+        # 36 is a manual calibration
+        time_to_wait = abs( 36 * step )
+
+        self.show_vane_moving(time_to_wait)
+        self.p1 = Thread(target = self.pause_and_label_exit, args = (str(time_to_wait) + ' ms', ) )
+        self.p1.start()
+        
+        data_raw = self._recv(6)
+        
+        #self.telemetry_text.appendPlainText( 'Rotary Vane: ' + str( self.curr_dB ) + ' dB')
+
+        self.prev_dB = self.curr_dB
+        self._record_vane()
+
+    def _record_vane(self):
+        try:
+            with open(self.path_status_file, 'r', encoding = 'utf-8') as f:
+                lines = f.readlines()
+            with open(self.path_status_file, 'w', encoding = 'utf-8') as f:
+                for line in lines:
+                    if line.startswith('Rotary Vane:'):
+                        f.write(f'Rotary Vane:  {self.curr_dB}\n')
+                    else:
+                        f.write(line)
+        except FileNotFoundError:
+            pass
+
+    def initialize(self):
+        """
+        A function to initialize a bridge.
+        """
+        if bridge_param.is_locked():
+            return
+
+        #MESSAGE = b'\x27' + b'\x01' + b'\x00'
+
+        #self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        #data_raw, addr = self.sock.recvfrom(3)
+
+        self.synt()
+
+        # synt() is the first exchange with the bridge; if it didn't answer the
+        # bridge is off/unreachable, so skip the rest of init rather than waiting
+        # out a timeout on every remaining command (keeps launch responsive).
+        if not self._connected:
+            return
+
+        # 300 MHz BW
+        MESSAGE = b'\x1b' + b'\x01' + b'\x02'
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        # 15 and 20 dB
+        temp = 2*self.Att1_prd.value()
+        MESSAGE = b'\x15' + b'\x01' + struct.pack(">B", int(temp))
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        temp = 2*self.Att2_prd.value()
+        MESSAGE = b'\x16' + b'\x01' + struct.pack(">B", int(temp))
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        #0.0 dB video2
+        temp = 2*self.Att2_prm.value()
+        MESSAGE = b'\x1a' + b'\x01' + struct.pack(">B", int(temp))
+        
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        # get amplification
+        MESSAGE = b'\x24' + b'\x01' + b'\x00'
+
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+        data_raw = self._recv(3)
+
+        # Rotary vane to 60 dB
+        MESSAGE = b'\x0e' + b'\x04' + b'\x01' + b'\x01' + (3).to_bytes( 2, byteorder = 'big', signed = False )
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+
+        self.show_vane_moving(5000)
+        self.p1 = Thread(target = self.pause_and_label_exit, args = ( '5 s', ) )
+        self.p1.start()
+        
+        data_raw = self._recv(6)
+        
+        self.curr_dB = 60
+        self.prev_dB = 60
+        self._record_vane()
+
+        #self.telemetry_text.appendPlainText( 'Initialization done' )
+    
+    def initialize_at_exit(self):
+        """
+        A function to initialize a bridge.
+        """
+        if bridge_param.is_locked():
+            return
+
+        #self.ecc15k.synthetizer_state('Off')
+        
+        # Rotary vane to 60 dB
+        step = int( self.calibration( 60 ) ) - int( self.calibration( self.prev_dB ) )
+        
+        MESSAGE = b'\x0e' + b'\x04' + b'\x01' + b'\x02' + ( step ).to_bytes( 2, byteorder = 'big', signed = True )
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+
+        time_to_wait = abs( 36 * step )
+
+        self.p1 = Thread(target = self.pause_and_label_exit, args = ( str(time_to_wait) + ' ms', ) )
+        self.p1.start()
+        
+        data_raw = self._recv(6)
+        
+        self.curr_dB = 60
+        self.prev_dB = 60
+        self._record_vane()
+
+    def turn_off(self):
+        """
+         A function to turn off a bridge.
+        """
+        self.quit()
+
+    def telemetry(self):
+        """
+        A function to get the telemetry.
+        """
+
+        MESSAGE = b'\x0d' + b'\x08' + (0).to_bytes(8, byteorder='big')
+        self.sock.sendto( MESSAGE, (self.UDP_IP, self.UDP_PORT) )
+
+        data_raw = self._recv(10)
+
+        if data_raw is None:
+            general.message('MW bridge telemetry unavailable: bridge not responding.')
+            return
+
+        data = data_raw #.decode()
+        if int(data[4]) == 1:
+            state = 'INIT'
+        elif int(data[4]) == 2:
+            state = 'WORK'
+        elif int(data[4]) == 3:
+            state = 'FAIL'
+
+        now = datetime.datetime.now().strftime("%d %b %Y %H:%M:%S")
+
+        header = (
+            f"{'Date: '} {now}\n"
+            f"{'Temp: '} {data[8]} C\n"
+            f"{'State: '} {state}\n"
+        )
+
+        general.message(header)
+
+    def calibration(self, x):
+        # approximation curve
+        # step to dB
+        return -4409.48 + 676.179 * exp( -0.0508708 * x ) + 2847.41 * exp( 0.00768761 * x ) - 0.345934 * x ** 2 + 2847.41 * exp( 0.00768761 * x ) - 440.034 * sqrt( x )
+
+def main():
+    """
+    A function to run the main window of the programm.
+    """
+    app = QApplication(sys.argv)
+    from atomize.general_modules.gui_style import apply_app_style
+    apply_app_style(app, app_id='Atomize.ITC.MWBridge', desktop='mw')
+    main = MainWindow()
+    main.show()
+    sys.exit(app.exec())
+
+if __name__ == '__main__':
+    main()

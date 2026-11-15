@@ -1,0 +1,229 @@
+# Two repos instead of five — roadmap
+
+Created 2026-11-15. Status: Phases 1 and 2 done; Phase 3 partly done. This file moved here from
+`Atomize_ITC/docs/stations/`.
+
+## Resume here
+
+State on 2026-11-15, end of session 2. Phase 1 is committed, pushed and synced into every fork.
+Phase 2 is built and committed locally; `Atomize_stations` is not pushed yet.
+
+| Repo | State |
+|---|---|
+| `Atomize` | `12dad09` (not pushed): `python -m atomize` starts an installed station's window; `ITC_FC.py` reads the Sibir curve from the user config copy; `test_preset_loader.py` moved to the ITC station |
+| `Atomize_stations` | first commit (not pushed): `README.md` and `itc/`, built from `Atomize_ITC` `070540e`; remote `origin` = `https://github.com/Anatoly1010/Atomize_stations.git`, branch `main` |
+| `Atomize_ITC`, the forks, `atomize_sync` | unchanged since their pushed commits; `Atomize_ITC` stays in use until Phase 4 |
+
+How `itc/` was built: every `Atomize_ITC` file that plain does not have or that differs from
+plain's, plus `tests/conftest.py` and `license.md`, minus `__main__.py`, `pyproject.toml`,
+`last_dir.py` (plain's is used), `ITC_FC.py` and the moved preset test. No `atomize/__init__.py`
+and no `device_modules/__init__.py`, so the folders join the core's. Changed against `Atomize_ITC`:
+`main.py` passes `lconf.ROOT_DIR/libs` to the core window; `epr_auto/params.py` finds the presets
+next to itself and `epr_auto/cli.py` finds `libs/` via `lconf.ROOT_DIR` (both used
+`atomize.__file__`, the core folder); `station.py` stops with a clear message when `atomize-py` is
+older than 0.5.0; new `pyproject.toml` (version 0.5.0, needs `atomize-py>=0.5` and `pyyaml`);
+`tests/test_preset_loader.py`, `test_insys_guard.py` (status file under `ROOT_DIR`) and
+`test_tr_two_fields.py` (device configs = core's + station's in a temporary folder);
+`CLAUDE.md` and `AGENTS.md` describe the station layout.
+
+Checks done in a fresh venv with the core and `itc/` installed in editable mode: app name
+`atomize-itc`, `ROOT_DIR` = `itc/`, both `atomize` folders joined, `python -m atomize` resolves to the
+station's `main.py`; station `pytest tests` 200 passed, 0 failed; `epr-auto run
+protocols/tune_up.yaml --test` 6/6 steps; the three `epr_auto` Insys checks pass and `libs/exam_*.ini`
+stay unchanged; the main window opens with the EPR Endstation Control tab and `itc/libs/` as working
+folder; plain `pytest` 197 passed. File check: core + `itc/` = `Atomize_ITC` apart from exactly the
+changes listed above.
+
+If `Atomize_ITC` changes before Phase 4, copy those files into `itc/` by hand (the changed spots
+above must stay).
+
+Next, in order:
+
+1. Push `Atomize` and `Atomize_stations` (the user does this).
+2. Finish Phase 3: open every control-center tool, one script per experiment type in test mode, and a
+   fresh start with no user configs.
+3. Phase 4 on the spectrometer PC, following the install guide (`~/claude/atomize-itc-install.md`
+   on the development machine).
+
+Decisions made: station repo `Atomize_stations`, fresh history, branch `main`; `atomize-itc`
+starts at 0.5.0; this roadmap lives in `itc/docs/stations/`; `python -m atomize` opens the station's
+window when one is installed; `Keysight_2000_Xseries_2.py` stays a station device;
+`PB_Insys_DAC_config.ini` and the Sibir curve are read from the user copy; ITC uses plain's
+`last_dir.py` (remembered folders now live in the user config folder, so they reset once). On the
+spectrometer PC only `~/sources/Atomize_ITC` exists (no plain Atomize, no `atomize_sync`).
+
+To continue, open Claude Code in `Atomize_stations/itc` and say: "Continue the station migration
+from `docs/stations/ROADMAP.md`, Resume here."
+
+## Goal
+
+- **`Atomize`** stays the public core, with no station code.
+- **One station repo** (`Atomize_stations`) holds ITC, NIOCH, NIOCH_Q and Cryomech,
+  each in its own folder, installed on top of the core.
+- No copies of the core in the stations, so nothing to sync from plain.
+- ITC moves first. The other stations follow the same recipe.
+
+## Design in short
+
+- Each station folder keeps today's layout: `itc/atomize/control_center/`, `itc/atomize/epr_auto/`,
+  `itc/atomize/main/main.py`, `itc/libs/`, `itc/protocols/`, `itc/icons/`, `itc/tests/`, `itc/docs/`.
+- The station's files join the core under the same `atomize` name. Import lines, protocol files,
+  user scripts and the `gui_vs_engine.py` harness therefore stay as they are.
+- A box installs the core and its own station folder. That install is what tells the box which
+  station it is.
+- The app name stays `atomize-itc`, so the user configs on the box are found and left untouched.
+
+## Open decisions
+
+- [x] Name of the station repo: `Atomize_stations`.
+- [x] History: start fresh; the old history stays in the archived repos.
+- [x] Where this roadmap lives after the move: `itc/docs/stations/` in the new repo.
+
+## Phase 1 — Prepare plain Atomize
+
+Small changes, invisible to a general user. Done and committed 2026-11-15 (`Atomize` `b5716b8`). `pytest tests` gives 9 failed / 178 passed both before and after; the 9 are old failures
+in `tests/test_liveplot_runs.py`.
+
+- [x] Lift what ITC leads on into plain: `documentation/functions/awg.md` and `digitizer.md`.
+      `Keysight_2000_Xseries_2.py` stays a station device; the differing `script_examples/` and
+      `tests/` stay with the station.
+- [x] Let an installed station add its folders to `atomize` and to `atomize.device_modules`
+      (one line in each `__init__.py`).
+- [x] A station declares itself with a small `atomize/station.py` holding its app name. The core
+      takes the app name and the station folder from it, otherwise `atomize-py` and its own folder
+      (`local_config.py`, `last_dir.py`). ITC then uses plain's `last_dir.py`.
+- [x] Runtime files (`libs/`, `bridge.param`, `libspinapi.so`, the Liveplot layout) are looked up in
+      the station folder: `Insys_FPGA.py`, `Micran_X_band_MW_bridge_v2.py`, `insys_status.py`,
+      `spinapi.py`, `main_window.py`. Without a station the places are today's.
+- [x] `Insys_FPGA.py` reads `PB_Insys_DAC_config.ini` from the user copy, like every other config.
+      Before, it read the copy in the code folder, which in the new layout would be plain's,
+      without ITC's I/Q tables.
+- [x] First-start copy of configs and example scripts: core defaults first, then the station's own
+      files on top.
+- [x] Each fork has an `atomize/station.py` with its app name and plain's `local_config.py`;
+      `sync_check.py` treats `local_config.py` and `atomize/__init__.py` as plain-led and
+      `station.py` as per fork. Not yet synced: `--sync -n` lists the same 7 files for each fork.
+- [x] Before syncing ITC: the three `epr_auto` check scripts (`insys_ini_checks.py`,
+      `live_rate_worker_checks.py`, `live_rate_driver_checks.py`) redirect `lconf.ROOT_DIR`
+      instead of `insys.__file__`. The DAC config is only read, so it needs no redirect.
+      `awg_phasing_insys.py` also found `libs/exam_adc.ini` through the driver's folder; it now
+      uses `lconf.ROOT_DIR` too.
+- [x] Version becomes 0.5.0.
+- [x] Check: plain alone works as before (`pytest tests`, three scripts in test mode, the main
+      window opens, configs still under `atomize-py`), and a made-up station joins correctly.
+
+## Phase 2 — Build the station repo with the ITC folder
+
+- [x] Create the repo and the `itc/` folder with its own `pyproject.toml`
+      (name `atomize-itc`, commands `atomize-itc` and `epr-auto`, needs `atomize-py>=0.5` and `pyyaml`).
+- [x] Move in everything ITC-only: `control_center/`, `epr_auto/`, `main/main.py`,
+      `main/protocol_launcher.py`, `libs/`, `general_modules/libspinapi.so`, `protocols/`, `icons/`,
+      `docs/`, the ITC-only `script_examples/` and `tests/`, `CLAUDE.md`, `AGENTS.md`, `.claude/agents/`.
+- [x] Station config files: the 9 device configs that differ from plain, `config.ini`, the Sibir
+      calibration curve.
+- [x] `atomize/station.py` with the app name `atomize-itc`.
+- [x] The station states the lowest core version it accepts and says so clearly at start if the
+      core is older.
+- [x] `python -m atomize` ran the core's `atomize/__main__.py` (plain window, no endstation tab).
+      Decided: the core's `__main__.py` starts the station's window when one is installed.
+- [x] `main.py`: point the working folder at the station's own `libs/` (today's `ptm = '../../libs'`
+      would land in the core folder).
+- [x] The Sibir calibration curve was read from the core's config folder by `ITC_FC.py`; it is now
+      read from the user copy.
+- [x] `math_modules/tests/test_preset_loader.py` needs the presets folder: moved to `itc/tests/`.
+- [x] Leave out every file that is the same as in plain.
+- [x] `epr_auto/params.py` and `epr_auto/cli.py` found the presets and `libs/` through
+      `atomize.__file__` (the core folder after the split); they now look in the station.
+
+## Phase 3 — Check on the development machine
+
+- [x] Fresh environment, install the core and `itc/`.
+- [x] File check: core + `itc/` together give the same files as today's `Atomize_ITC`, apart from a
+      short expected list.
+- [x] `pytest` passes.
+- [ ] `atomize-itc` opens with the endstation tab; every control-center tool opens.
+- [ ] One script per experiment type passes in test mode.
+- [x] `epr-auto run protocols/tune_up.yaml --test` passes.
+- [ ] A fresh start with no user configs copies the right ITC values.
+
+## Phase 4 — Spectrometer PC
+
+Linux box, `python3`. Today only `~/sources/Atomize_ITC` is there; plain Atomize and `atomize_sync`
+are not installed and are not needed on the box. Needs about half a day with no experiment planned.
+`~/sources/Atomize_ITC` is not touched, so going back takes a minute.
+
+**A. Record and back up**
+
+- [ ] Close Atomize and all control-center windows.
+- [ ] `cd ~/sources/Atomize_ITC && git status` — commit and push any local edits made on the box.
+- [ ] `pip show atomize-itc` and `which atomize-itc epr-auto` — note how it is installed now.
+- [ ] Reference results: `gui_vs_engine.py` reports ALL PASS (if the harness is on the box); record a
+      standard echo on the usual sample (amplitude, phase, settings).
+- [ ] Compare `PB_Insys_DAC_config.ini` in the repo and in `~/.config/atomize-itc/device_config/`;
+      the repo one is in use today and holds the I/Q tables.
+- [ ] Back up the user configs: `cp -a ~/.config/atomize-itc ~/atomize-itc_config_backup`.
+- [ ] Back up the local files kept inside the repo folder (not in git, or changed at runtime):
+
+      ```bash
+      cd ~/sources/Atomize_ITC
+      git ls-files --others --modified | grep -v __pycache__ | sort -u > ~/itc_local_files.txt
+      rsync -a --files-from=$HOME/itc_local_files.txt . ~/itc_local_backup/
+      ```
+
+      This covers the `*.param` files, `libs/status`, the Liveplot layout, saved presets in
+      `atomize/epr_auto/presets/`, `protocols/tuned/` and `protocols/runs/`.
+
+**B. Install**
+
+- [ ] `pip uninstall atomize-itc`
+- [ ] `git clone` plain Atomize to `~/sources/Atomize`, then `pip install -e ~/sources/Atomize`.
+- [ ] `git clone` the station repo to `~/sources/Atomize_stations`, then `pip install -e ~/sources/Atomize_stations/itc`.
+- [ ] Copy the I/Q tables (`iq_cal_*`, `rx_cal_*`) into the user copy of `PB_Insys_DAC_config.ini`.
+- [ ] Check that `Calibration_curve_08_2024_Sibir_magnet.csv` is in `~/.config/atomize-itc/device_config/`;
+      if not, copy it there from `~/sources/Atomize_ITC/atomize/device_modules/config/`.
+- [ ] Put the local files back: `rsync -a ~/itc_local_backup/ ~/sources/Atomize_stations/itc/`
+- [ ] Desktop launcher and icons: `python3 ~/sources/Atomize_stations/itc/icons/install_desktop.py`
+- [ ] `gui_vs_engine.py` (if on the box): point it at the new presets folder if the old path is written in it.
+
+**C. Checks without hardware**
+
+- [ ] `atomize-itc` starts with the endstation tab.
+- [ ] `diff -r ~/.config/atomize-itc ~/atomize-itc_config_backup` shows no differences.
+- [ ] A known script passes with Test Scripts ticked.
+- [ ] `epr-auto run protocols/tune_up.yaml --test` passes.
+- [ ] `gui_vs_engine.py` reports ALL PASS (if on the box).
+- [ ] `pytest` passes.
+
+**D. Checks with hardware (operator present)**
+
+- [ ] Open each tool once: MW bridge, field, temperature, tune preset, RECT phasing, AWG phasing,
+      CW, TR with its scopes.
+- [ ] The Insys board opens and the standard echo matches the reference from step A.
+- [ ] Live edit works in the AWG phasing tool.
+- [ ] One short protocol runs live from the launcher.
+
+**Going back**
+
+```bash
+pip uninstall atomize-itc atomize-py
+pip install -e ~/sources/Atomize_ITC
+```
+
+The user configs are the same folder in both setups, so nothing is lost either way. Copy back any
+`*.param` or preset changed in the meantime.
+
+## Phase 5 — Settle ITC
+
+- [ ] One week of normal use on the new setup.
+- [ ] Repeat the install on the Windows development machine (`python`, test mode only).
+- [ ] `sync_check.py` (development machine): ITC leaves the list of forks; it stays the source for the shared
+      control-center tools of NIOCH and NIOCH_Q, read from `Atomize_stations/itc/`.
+- [ ] Archive `Atomize_ITC` on GitHub (read-only) with a readme line pointing to the new repo.
+- [ ] Update install instructions in `atomize_docs` where they mention the ITC repo.
+
+## Phase 6 — Later
+
+- [ ] NIOCH_Q, NIOCH and Cryomech, each with Phases 2–5. Device differences: values go to config
+      files, station behaviour goes to a small extension in the station folder.
+- [ ] Merge the control-center tools that exist in several versions, one at a time when touched.
+- [ ] Archive `atomize_sync` once the last station has moved.

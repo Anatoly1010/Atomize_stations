@@ -1,0 +1,1140 @@
+"""Tuning primitives: auto-phase, pi calibration (fine), power-for-length (coarse).
+
+All acquisition goes through the engine (snapshot -> Worker); every primitive
+first pre-flights its exact WorkerArgs with script_test=True (the Worker
+child forces test-mode devices for that run), then acquires for real — or,
+in a dry-run session, stops after the pre-flight and returns a canned result
+so the judges and the state flow are still exercised end-to-end.
+
+Physics conventions (see ARCHITECTURE.md 'Flip-angle knobs'):
+- The nutation presets are inversion-detection sequences: the swept pulse
+  precedes a fixed selective echo pair, so the echo goes as cos(theta) of
+  the swept pulse — pi at the first minimum, pi/2 at the zero crossing.
+- In an Amplitude-sweep preset the swept pulse is the one with a nonzero
+  Start Increment (the worker's name_list criterion); in a length-nutation
+  preset it is the one with a nonzero Length Increment.
+- theta(x) is fitted as b*x + s*x^2: the quadratic term absorbs amplifier
+  compression, so amp(pi) and amp(pi/2) come out independently instead of
+  assuming amp(pi) = 2*amp(pi/2).
+"""
+import math
+import time
+import copy
+from pathlib import Path
+
+import numpy as np
+from scipy.optimize import curve_fit
+
+from atomize.epr_auto.engine import executor, snapshot
+from atomize.epr_auto.primitives.judges import (
+    JudgeReport, amplitude_rails, convergence, echo_snr, fit_quality,
+    length_rails, phase_coherence, pi_ratio_linearity,
+)
+
+# canned dry-run numbers (ratio deliberately != 2: the linearity judge must
+# not learn to expect the ideal value)
+_CANNED_PI, _CANNED_PI2 = 68.0, 33.5
+
+# hard/soft pulse cut, as a length ratio: soft/selective detection sits at
+# ~3-4x the shortest hard pulse (ampl_4s/rabi presets: 3x+), while a
+# length-encoded pi is exactly 2x its pi/2 (hahn style), so the cut must sit
+# between 2 and 3. Shared by _infer_cal_map (hard = below, vs the shortest MW
+# pulse) and _scale_detection_pair (pair = at/above, vs the swept pulse) so
+# the two primitives can never classify the same pulse both ways.
+_SOFT_LEN_RATIO = 2.5
+
+
+# --------------------------------------------------------------- plumbing
+
+def _session_overrides(session):
+    """Calibration results earlier steps stored: flow them into every build."""
+    ov = {}
+    ap = session.state.get('auto_phase')
+    if ap:
+        ov['zero_order_deg'] = ap['zero_order_deg']
+    fd = session.state.get('field')
+    if fd:
+        ov['field'] = float(str(fd).split(' ')[0])
+    ew = session.state.get('echo_window')
+    if ew:
+        # stored relative to the DETECTION pulse start — the same frame the
+        # preset's Window left/right live in, so it transfers across presets
+        # whose tau (absolute echo position) differs
+        ov['win_left_ns'] = ew['win_left_ns']
+        ov['win_right_ns'] = ew['win_right_ns']
+    return ov
+
+
+def load_tuned_preset(session, path):
+    """Load the selected preliminary pulse settings when this source was tuned."""
+    selected = session.state.get('_preliminary_preset')
+    if selected is not None and Path(selected.path).resolve() == Path(path).resolve():
+        return copy.deepcopy(selected)
+    return snapshot.load_preset(path)
+
+
+def _resolve_rep_rate(session, rep_rate):
+    """Resolve an explicit rate or an accepted tune.rep_rate recommendation."""
+    if rep_rate != 'auto':
+        return rep_rate
+    rr = session.state.get('rep_rate')
+    if not rr or rr.get('rep_rate_hz') is None:
+        raise ValueError('rep_rate: auto — no tune.rep_rate result in the '
+                         'session (run tune.rep_rate first)')
+    from atomize.epr_auto.primitives.exp import _fmt_s
+    session.log(f"      rep_rate auto -> {rr['rep_rate_hz']:g} Hz "
+                f"({rr['mode']}, T1_eff "
+                + (_fmt_s(rr['t1_eff_s']) if rr.get('t1_eff_s') else 'below the grid')
+                + ')')
+    return rr['rep_rate_hz']
+
+
+def _build(session, preset_path, exp_name, slot_coef=None, **overrides):
+    """Preset -> (preset, WorkerArgs) with session calibrations + explicit
+    overrides applied. slot_coef=(slot_index, value) — or a list of such
+    pairs — overrides pulse amplitude coefficients (a nested field
+    build_worker_args overrides can't reach). Accepts a path or an
+    already-loaded Preset (which is mutated — pass a fresh parse, never a
+    cached one).
+
+    The automation consumes 1-D demodulated integrals only (the worker routes
+    readouts through Insys_FPGA.digitizer_demodulate(..., integral=True) when
+    iq_cor == 1). The preset's 'Shift Offset' checkbox ('IQ Correction:  2' ->
+    iq_cor 1) is a GUI display preference, not an acquisition capability, and
+    everything the demodulated mode needs (DETECTION iq_freq, integration
+    window, zero-order phase) is threaded regardless — so we FORCE iq_cor = 1
+    here rather than reject a preset saved with the box off. WorkerArgs packs
+    its arg tuples lazily (exp_args/dig_args read self.iq_cor at call time), so
+    this post-build set reaches both the exp and dig paths."""
+    preset = preset_path if isinstance(preset_path, snapshot.Preset) \
+        else load_tuned_preset(session, preset_path)
+    if slot_coef is not None:
+        pairs = [slot_coef] if isinstance(slot_coef[0], int) else slot_coef
+        for idx, value in pairs:
+            preset.slots[idx].coef = float(value)
+    ov = _session_overrides(session)
+    ov.update({k: v for k, v in overrides.items() if v is not None})
+    wa = snapshot.build_worker_args(preset, exp_name=exp_name, **ov)
+    if wa.iq_cor != 1:
+        session.log('      preset saved with Shift Offset off — enabling the '
+                    'demodulated 1-D mode (iq_cor 1) for the automation run')
+        wa.iq_cor = 1
+    return preset, wa
+
+
+def _full_2d(wa, enabled):
+    wa.save2d = wa.save_hdf5 = int(bool(enabled))
+
+
+def _data_files(path):
+    files = {'data_file': str(path)}
+    path_2d = Path(str(Path(path).with_suffix('')) + '_2d.h5')
+    if path_2d.exists():
+        files['data_file_2d'] = str(path_2d)
+    return files
+
+
+def _acquire(session, wa, sweep_type, tag, log=None, scan_control=None,
+             on_scan_data=None):
+    """Pre-flight, then acquire. Returns (x, i, q, path) or None in test mode.
+    scan_control / on_scan_data are the executor's 'SC<n>' adaptive-scan
+    callbacks (see exp._duration_policy / exp._snr_policy). _build has already
+    forced wa.iq_cor == 1 (the demodulated 1-D mode the automation consumes),
+    so no per-acquisition IQ-correction check is needed here."""
+    executor.run_worker(wa, sweep_type, script_test=True)
+    if session.test:
+        return None
+    session.ensure_hardware_locks()
+    path = session.save_path(tag)
+    x, i, q = executor.acquire_1d(wa, sweep_type, path,
+                                  on_message=log and (lambda m: log(f'      worker: {m}')),
+                                  scan_control=scan_control,
+                                  on_scan_data=on_scan_data)
+    return x, i, q, path
+
+
+def _phase_deg(sig):
+    from atomize.math_modules.fft import Fast_Fourier
+    return Fast_Fourier.auto_phase_zero(sig)
+
+
+def _to_real(sig):
+    """Rotate a complex trace onto its principal axis (ph_correction
+    convention: multiply by exp(+i*phi))."""
+    phi = _phase_deg(sig)
+    return (sig * np.exp(1j * np.radians(phi))).real
+
+
+def _swept_slot(preset, mode):
+    """Index (into preset.slots) of the pulse the sweep moves: nonzero
+    st_inc for Amplitude presets, nonzero len_inc for length nutation."""
+    attr = 'st_inc' if mode == 'amplitude' else 'len_inc'
+    hits = [i for i, s in enumerate(preset.slots)
+            if i > 0 and s.active and getattr(s, attr) != 0.0]
+    if len(hits) != 1:
+        raise ValueError(
+            f'{preset.path}: expected exactly one swept pulse '
+            f'(active P2..P9 with nonzero {attr}), found {len(hits)}')
+    return hits[0]
+
+
+# ------------------------------------------------------------- auto-phase
+
+def _phase_temperature(session):
+    """Temperature the phase is being measured at: the last temp step's
+    setpoint, or — before any temp step has run — the cryostat's measured
+    channel-B temperature, so the first temp.set/temp.wait still has a
+    reference to compare against (_rephase_check) instead of dropping the
+    phase unconditionally. None only when the Lakeshore is off/unreachable
+    (the check then keeps its conservative drop). Read here, at measurement
+    time, not in _rephase_check: temp.wait also covers external setpoints,
+    where the temperature may already be ramping by check time. A setpoint
+    that temp.wait never confirmed ('reached' False) is not trusted — fall
+    through to the measured channel so a failed/skipped wait can't anchor a
+    later re-phase test at a temperature the cryostat never reached."""
+    t = session.state.get('temperature')
+    if t and t.get('reached'):
+        return t.get('setpoint')
+    try:
+        return float(session.temp_controller.tc_temperature('B'))
+    except Exception:
+        return None
+
+
+def auto_phase(session, preset, points=16, scans=1):
+    """Acquire a short echo run, measure the residual signal phase
+    (principal-axis auto_phase_zero) and store the corrected zero-order
+    (digitizer_demodulate rotates by exp(-i*zero_order), so the update is
+    zero_order_new = zero_order_used - phi_residual)."""
+    pre, wa = _build(session, preset, exp_name='AutoPhase',
+                     points=points, scans=scans)
+    acq = _acquire(session, wa, pre.sweep_type, 'auto_phase', log=session.log)
+
+    at_k = _phase_temperature(session)
+    if acq is None:
+        result = {'phase_deg': 0.0, 'zero_order_deg': pre.zero_order_deg,
+                  'temperature_k': at_k, 'canned': True}
+        session.stage_state('auto_phase', {'zero_order_deg': pre.zero_order_deg,
+                                           'temperature_k': at_k})
+        return result, [JudgeReport('phase_coherence', True, float('inf'),
+                                    {'note': 'dry-run, not judged'})]
+
+    x, i, q, path = acq
+    sig = i + 1j * q
+    phi = _phase_deg(sig)
+    used = pre.zero_order_deg          # post-build: includes session override
+    new_zero = round((used - phi) % 360.0, 2)
+
+    session.stage_state('auto_phase', {'zero_order_deg': new_zero,
+                                       'temperature_k': at_k})
+    result = {'phase_deg': round(phi, 2), 'zero_order_deg': new_zero,
+              'temperature_k': at_k, 'data_file': path}
+    # phase_coherence, not echo_snr: a `points`-long trace has too few
+    # point-to-point differences for the MAD-of-diff noise estimate
+    return result, [phase_coherence(sig)]
+
+
+# ------------------------------------------------- calibration hand-off
+
+def _envelope_area(typ, length, sigma):
+    """Mean of the AWG envelope over the pulse, peak-referenced (the driver
+    generates amp * envelope with envelope peak 1, so the on-resonance flip
+    angle goes as amp * length * area — Insys_FPGA define_buffer shapes).
+    SINC uses the signed mean: its negative lobes subtract rotation. None
+    for shapes the linear rule cannot model (adiabatic WURST/SECH)."""
+    if typ == 'SINE':
+        return 1.0
+    if typ in ('GAUSS', 'SINC') and sigma > 0 and length > 0:
+        t = (np.arange(4096) + 0.5) * (float(length) / 4096)
+        if typ == 'GAUSS':
+            env = np.exp(-0.5 * ((t - length / 2) / float(sigma)) ** 2)
+        else:
+            env = np.sinc(2 * (t - length / 2) / float(sigma))
+        return float(np.mean(env))
+    return None
+
+
+def _slot_area(s, grid):
+    return _envelope_area(s.typ, snapshot._snap(s.length, grid),
+                          snapshot._snap(s.sigma, grid))
+
+
+def _infer_cal_map(preset):
+    """Default apply_cal mapping (ARCHITECTURE.md 'Tune-up completeness'):
+    among the active hard MW pulses (P2..P9, BLANK/LASER excluded;
+    soft/selective detection pulses excluded by the >= 2x-shortest length
+    criterion) the preset's own two amplitude levels map to pi (higher
+    level) and pi/2 (lower). Anything else is ambiguous -> explicit map."""
+    mw = [(i, s) for i, s in enumerate(preset.slots)
+          if i > 0 and s.active and s.typ not in ('BLANK', 'LASER')]
+    if not mw:
+        raise ValueError('apply_cal: the preset has no active MW pulses to patch')
+    min_len = min(s.length for _, s in mw)
+    hard = [(i, s) for i, s in mw if s.length < _SOFT_LEN_RATIO * min_len]
+    amp_levels = sorted({s.coef for _, s in hard})
+    if len(amp_levels) == 2:
+        lo = amp_levels[0]
+        return {f'P{i + 1}': ('pi2' if s.coef == lo else 'pi') for i, s in hard}
+    len_levels = sorted({s.length for _, s in hard})
+    if len(amp_levels) == 1 and len(len_levels) == 2:
+        # equal amplitudes, pi encoded as the 2x-longer pulse (hahn_echo style)
+        lo = len_levels[0]
+        return {f'P{i + 1}': ('pi2' if s.length == lo else 'pi') for i, s in hard}
+    found = ', '.join(f'P{i + 1}={s.coef}%/{s.length}ns' for i, s in hard)
+    raise ValueError(
+        'apply_cal: cannot infer the pulse roles — expected two amplitude '
+        'levels, or one amplitude level with two pulse lengths, among the '
+        f'hard MW pulses; found [{found}]; give an explicit map, e.g. '
+        'apply_cal: {P2: pi2, P3: pi}')
+
+
+def apply_calibration(session, preset, mapping=None):
+    """Patch a loaded Preset in place with the session's pi_calibration
+    result: amplitude-mode calibrations set the mapped slots' amplitude
+    coefficient at fixed length; length-mode calibrations set the length,
+    quantized to the preset's AWG grid (nearest multiple). mapping is the
+    explicit {P2..P9: pi|pi2} map; None infers it (_infer_cal_map).
+    Returns {slot: {role, field, value}} describing the patch, or None when
+    the session has no calibration yet (nothing to apply)."""
+    cal = session.state.get('pi_calibration')
+    if cal is None:
+        if mapping is not None:
+            raise ValueError('apply_cal: no pi_calibration result in the '
+                             'session (run tune.pi_calibration first)')
+        return None
+    if cal.get('pi') is None or cal.get('pi2') is None:
+        raise ValueError('apply_cal: the pi_calibration result is incomplete '
+                         f"(pi={cal.get('pi')}, pi2={cal.get('pi2')})")
+    if cal.get('rails'):
+        raise ValueError(f"apply_cal: the pi_calibration result railed "
+                         f"({cal['rails']}) — not a valid calibration; "
+                         're-run the coarse power stage')
+    if mapping is None:
+        mapping = _infer_cal_map(preset)
+
+    grid = preset.awg_grid
+    patched = {}
+    for slot_name, role in sorted(mapping.items()):
+        idx = int(slot_name[1:]) - 1
+        s = preset.slots[idx]
+        if not s.active:
+            raise ValueError(f'apply_cal: {slot_name} is inactive in '
+                             f'{preset.path}')
+        value = float(cal['pi' if role == 'pi' else 'pi2'])
+        if cal['mode'] == 'amplitude':
+            # flip angle ~ amp * L * <envelope>: the area factor rides along with the length ratio
+            l_cal = cal.get('length_ns')
+            if l_cal:
+                l_slot = snapshot._snap(s.length, grid)
+                f_cal = cal.get('shape_factor')
+                f_slot = _slot_area(s, grid)
+                if f_cal is None or f_slot is None:
+                    if s.typ == cal.get('shape_typ') and l_slot == float(l_cal):
+                        f_cal = f_slot = 1.0   # identical envelope: cancels
+                    else:
+                        raise ValueError(
+                            'apply_cal: cannot transfer the calibration from '
+                            f"a {cal.get('shape_typ')} pulse to {slot_name} "
+                            f'({s.typ}) — no envelope area factor for this '
+                            'shape; calibrate with a matching preset')
+                value = round(value * float(l_cal) * f_cal / (l_slot * f_slot), 2)
+            if value > 100.0:
+                if cal.get('canned'):
+                    # dry-run: the canned pi/pi2 are placeholders, so an
+                    # over-rail scaling proves nothing about the real preset —
+                    # log and leave the slot unpatched instead of failing
+                    session.log(f'      apply_cal: {slot_name} would need '
+                                f'{value}% (> 100%) with the canned dry-run '
+                                'calibration — left unpatched')
+                    continue
+                raise ValueError(
+                    f'apply_cal: {slot_name} would need {value}% (> 100%) at '
+                    f'{s.length} ns — re-run the coarse power stage (more '
+                    'power) or lengthen the pulse')
+            s.coef = value
+            patched[slot_name] = {'role': role, 'field': 'amplitude',
+                                  'value': value, 'unit': '%'}
+        else:
+            q = round(max(1, round(value / grid)) * grid, 2)
+            s.length = q
+            patched[slot_name] = {'role': role, 'field': 'length',
+                                  'value': q, 'unit': 'ns'}
+    return patched
+
+
+# ------------------------------------------------------------ echo window
+
+# rejected candidates carried into the log / judge details (strongest first)
+_MAX_REJECTED = 5
+
+
+def _find_echo(t, mag, search_from_ns=0.0, min_width_ns=0.0):
+    """Echo in a smoothed |V| trace: candidates are the runs of samples above
+    the median floor at or after search_from_ns, taken strongest first; the
+    winner is the first whose FWHM reaches min_width_ns. A narrower one is a
+    transient (the receiver defence pulse ends a few samples into the trace),
+    not an echo. Returns (center, fwhm, resolved, rejected) — the rejected
+    entries are the stronger-but-too-narrow candidates; center is None when
+    none of them is wide enough."""
+    t, mag = np.asarray(t, dtype=float), np.asarray(mag, dtype=float)
+    floor = float(np.median(mag))      # echo occupies a minority of the window
+    idx = np.nonzero((mag > floor) & (t >= float(search_from_ns)))[0]
+    cands = []
+    for grp in np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1):
+        if not grp.size:
+            continue
+        c_idx = int(grp[int(np.argmax(mag[grp]))])
+        peak = float(mag[c_idx])
+        half = floor + (peak - floor) / 2.0
+        below_l = np.nonzero(mag[:c_idx] < half)[0]
+        below_r = np.nonzero(mag[c_idx:] < half)[0]
+        l_idx = int(below_l[-1]) + 1 if below_l.size else 0
+        r_idx = c_idx + int(below_r[0]) - 1 if below_r.size else len(t) - 1
+        # resolved: an FWHM edge on the trace boundary = echo cut off
+        cands.append((peak, float(t[c_idx]), float(t[r_idx] - t[l_idx]),
+                      below_l.size > 0 and below_r.size > 0))
+    rejected = []
+    for _, center, fwhm, resolved in sorted(cands, reverse=True):
+        if fwhm >= float(min_width_ns):
+            return center, fwhm, resolved, rejected
+        if len(rejected) < _MAX_REJECTED:
+            rejected.append({'center_ns': round(center, 1),
+                             'fwhm_ns': round(fwhm, 1)})
+    return None, None, False, rejected
+
+
+def echo_window(session, preset, factor=2.0, sweeps=3, search_from='200 ns',
+                min_width='20 ns'):
+    """Tune the integration window from an averaged echo trace (engine
+    acquire_trace on the Worker's dig_on preview path, accumulating mode):
+    center = max of the smoothed |V(t)|, width = FWHM * factor, edges
+    rounded outward onto the ADC grid (0.4 ns * decimation) and clamped to
+    the detection window. Stored relative to the DETECTION pulse start and
+    applied to every later build via the session overrides — MUST run
+    before tune.auto_phase, which integrates over this window.
+
+    The peak search ignores the trace before `search_from` and rejects any
+    candidate narrower than `min_width`: on this spectrometer the receiver
+    defence transient sits ~150 ns into the trace and can out-peak the echo,
+    which lands ~250-350 ns after the DETECTION start (a constant
+    ADC/detection-chain delay)."""
+    from atomize.epr_auto.params import parse_time_ns
+    factor = float(factor)
+    if factor < 1.0:
+        raise ValueError(f'factor must be >= 1 (got {factor})')
+    search_from_ns = parse_time_ns(search_from)
+    min_width_ns = parse_time_ns(min_width)
+    pre, wa = _build(session, preset, exp_name='EchoWindow')  # forces iq_cor 1
+    executor.acquire_trace(wa, script_test=True)
+    if session.test:
+        result = {'win_left_ns': pre.win_left_ns,
+                  'win_right_ns': pre.win_right_ns,
+                  'center_ns': round((pre.win_left_ns + pre.win_right_ns) / 2, 1),
+                  'fwhm_ns': None, 'canned': True}
+        session.stage_state('echo_window', {'win_left_ns': pre.win_left_ns,
+                                            'win_right_ns': pre.win_right_ns})
+        return result, [JudgeReport('echo_in_trace', True, float('inf'),
+                                    {'note': 'dry-run, not judged'})]
+
+    session.ensure_hardware_locks()
+    t_s, i, q = executor.acquire_trace(
+        wa, n_sweeps=sweeps,
+        on_message=lambda m: session.log(f'      worker: {m}'))
+    t = t_s * 1e9                      # dig_on plots the trace axis in seconds
+    sig = i + 1j * q
+    tpp = 0.4 * pre.decimation         # ADC grid after decimation
+    mag = _smooth(np.abs(sig), max(3, round(3.0 / tpp)) | 1)  # ~3 ns box, not trace-scaled
+
+    center, fwhm, resolved, rejected = _find_echo(t, mag, search_from_ns,
+                                                  min_width_ns)
+    for r in rejected:
+        session.log(f"      rejected a {r['fwhm_ns']} ns candidate at "
+                    f"{r['center_ns']} ns (narrower than {min_width} — "
+                    'transient, not an echo)')
+
+    t_end = float(t[-1])
+    path = session.save_path('echo_window')
+    np.savetxt(path, np.column_stack((t, i, q)), delimiter=',',
+               header='time_ns,i_mv,q_mv')
+
+    if center is None:
+        reason = (f'no candidate wider than {min_width} after {search_from} '
+                  f'in a {round(t_end, 1)} ns trace')
+        return ({'win_left_ns': None, 'win_right_ns': None, 'center_ns': None,
+                 'fwhm_ns': None, 'data_file': path},
+                [JudgeReport('echo_in_trace', False, 0.0,
+                             {'reason': reason, 'rejected': rejected,
+                              'trace_ns': round(t_end, 1)}),
+                 echo_snr(sig)])
+
+    win_l = max(0.0, math.floor((center - fwhm * factor / 2) / tpp) * tpp)
+    win_r = min(t_end, math.ceil((center + fwhm * factor / 2) / tpp) * tpp)
+    win_l, win_r = round(win_l, 1), round(win_r, 1)
+
+    session.stage_state('echo_window', {'win_left_ns': win_l,
+                                        'win_right_ns': win_r})
+    result = {'win_left_ns': win_l, 'win_right_ns': win_r,
+              'center_ns': round(center, 1), 'fwhm_ns': round(fwhm, 1),
+              'data_file': path}
+    details = {'center_ns': round(center, 1), 'trace_ns': round(t_end, 1),
+               'clamped': win_l == 0.0 or win_r == round(t_end, 1)}
+    if rejected:
+        details['rejected'] = rejected
+    judges = [JudgeReport('echo_in_trace', resolved, round(fwhm, 1), details),
+              echo_snr(sig)]
+    return result, judges
+
+
+# ---------------------------------------------------------- auto rep-rate
+
+# canned dry-run T1_eff (seconds); deliberately not a round number
+_CANNED_T1_EFF = 1.2e-3
+
+# 'sensitivity' mode period, in units of T1_eff: maximizing the echo
+# amplitude per unit sqrt(time), A(T)/sqrt(T) with A = A0*(1-exp(-T/T1)),
+# gives the classic T ~= 1.26*T1 optimum (partial saturation accepted —
+# fine for tuning/EDFS, NOT for quantitative relaxation runs)
+_SENSITIVITY_PERIODS = 1.26
+
+# residual saturation exp(-T_slowest/T1_eff) above this means the whole grid
+# is still saturated: T1_eff is an extrapolation, not a measurement
+_COVERAGE_RESIDUAL = 0.15
+
+# amplitude spread below this fraction of the maximum = flat curve: no
+# saturation observed anywhere, T1_eff is far below the fastest period
+_FLAT_SPREAD = 0.05
+
+# spread above this = the deviations from the median are dominated by the
+# real saturation structure, not by amplitude noise — enough to also demand
+# collinear deviations from phase_coherence (require_structure), which a
+# constant LO-leakage phasor cannot fake. Between _FLAT_SPREAD and this the
+# deviations may be mostly noise, so the structure gate would false-fail a
+# real low-SNR echo
+_STRUCTURED_SPREAD = 0.15
+
+
+def _recommend_rate(t1_eff_s, factor, mode, rate_max, log):
+    """Recommended repetition rate from T1_eff: period = factor*T1_eff
+    ('quantitative', <1% residual saturation at factor 5) or 1.26*T1_eff
+    ('sensitivity'). Never above the tested grid's fastest rate — beyond it
+    the saturation model is extrapolation."""
+    periods = float(factor) if mode == 'quantitative' else _SENSITIVITY_PERIODS
+    rate = 1.0 / (periods * t1_eff_s)
+    if rate < 0.1:
+        raise ValueError(f'recommended repetition rate {rate:.4g} Hz is below '
+                         'the supported minimum of 0.1 Hz; the requested '
+                         f'{mode} recovery period cannot be reached')
+    if rate > rate_max:
+        log(f'      recommended {rate:.4g} Hz exceeds the tested grid — '
+            f'clamping to rate_max {rate_max:g} Hz')
+        rate = float(rate_max)
+    return min(float(f'{rate:.4g}'), float(rate_max))
+
+
+def _acquire_live_rates(session, wa, rates, points, scans, max_wait):
+    """Preflight the whole sweep, then journal fresh live curves as they arrive."""
+    import csv
+
+    executor.acquire_live_rates(wa, rates, points, scans, max_wait,
+                                script_test=True, on_message=session.log)
+    if session.test:
+        return None, None
+    session.ensure_hardware_locks()
+    path = session.save_path('rep_rate_live')
+    session.log(f'      live repetition-rate observations: {path}')
+    with open(path, 'w', newline='', encoding='utf-8') as stream:
+        columns = ['rate_index', 'rate_hz', 'elapsed_s', 'buffer', 'i', 'q', 'valid', 'spread']
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+
+        def record(observation):
+            writer.writerow(observation)
+            stream.flush()
+
+        signals = executor.acquire_live_rates(
+            wa, rates, points, scans, max_wait, on_curve=record, on_message=session.log)
+    return signals, path
+
+
+def rep_rate(session, preset, rate_min=10.0, rate_max=2000.0, steps=6,
+             points=3, scans=1, factor=5.0, mode='quantitative', max_wait='120 s'):
+    """Fixed-tau live echo saturation; accept consecutive fresh curves within 5%.
+
+    The card stays open and the field stays fixed across the logarithmic grid.
+    Each observation comes from digitizer_get_curve(live_mode=1). Three fresh
+    curves qualify by default; points and scans extend the convergence check.
+    A(T) = A0 * (1 - exp(-T/T1_eff)) still assumes longitudinal reset by the
+    repeated sequence. The accepted result supplies subsequent rep_rate: auto.
+    """
+    from atomize.epr_auto.params import parse_time_ns
+
+    rate_min, rate_max = float(rate_min), float(rate_max)
+    if not (np.isfinite(rate_min) and np.isfinite(rate_max)
+            and 10 <= rate_min <= 100000 and 10 <= rate_max <= 100000):
+        raise ValueError('live repetition rates must be within 10–100000 Hz')
+    if rate_min >= rate_max:
+        raise ValueError(f'rate_min must be < rate_max, '
+                         f'got {rate_min:g} .. {rate_max:g} Hz')
+    rates = np.geomspace(rate_min, rate_max, int(steps))
+    periods = 1.0 / rates
+    pre = load_tuned_preset(session, preset)
+    if len([slot for slot in pre.slots[1:] if slot.active and slot.typ not in ('BLANK', 'LASER')]) != 2:
+        raise ValueError('tune.rep_rate needs a two-pulse echo preset at fixed tau')
+    apply_calibration(session, pre)
+    for slot in pre.slots:
+        slot.st_inc = slot.len_inc = slot.st_inc2 = 0.0
+    pre.rep_rate = rate_min
+    pre, wa = _build(session, pre, exp_name='RepRate', points=1, scans=1)
+    if wa.laser_flag >= 1 and wa.laser_num == 1:
+        raise ValueError('Nd:YAG repetition rate is fixed at 9.9 Hz; rate tuning is unavailable')
+    sigs, history_path = _acquire_live_rates(
+        session, wa, rates, int(points), int(scans), parse_time_ns(max_wait) / 1e9)
+    amps = [] if sigs is None else [float(abs(np.mean(sig))) for sig in sigs]
+
+    if session.test:          # every rate pre-flighted above; canned result
+        rec = _recommend_rate(_CANNED_T1_EFF, factor, mode,
+                              rate_max, session.log)
+        result = {'t1_eff': '1.2 ms', 't1_eff_s': _CANNED_T1_EFF,
+                  'rep_rate_hz': rec, 'mode': mode, 'canned': True}
+        session.stage_state('rep_rate', {'t1_eff_s': _CANNED_T1_EFF,
+                                         'rep_rate_hz': rec, 'mode': mode,
+                                         'temperature_k': _phase_temperature(session)})
+        return result, [JudgeReport('rep_rate_fit', True, float('inf'),
+                                    {'note': 'dry-run, not judged'})]
+
+    amps = np.asarray(amps)
+    curve_path = session.save_path('rep_rate_curve')
+    np.savetxt(curve_path, np.column_stack((rates, periods, amps)),
+               delimiter=',', header='rate_hz,period_s,amplitude')
+
+    a_max = float(amps.max())
+    spread = (a_max - float(amps.min())) / a_max if a_max > 0 else 0.0
+    # no echo anywhere = no signal at all: fail here instead of
+    # "recommending" rate_max off a flat noise curve. phase_coherence, not
+    # echo_snr: these are short, deliberately FLAT echo curves — no
+    # peak-above-baseline for the MAD-of-diff metric (same reason
+    # auto_phase judges with it). Judged on ALL acquisitions concatenated:
+    # a real echo shares one phase across rates (amplitude may vary), while
+    # steps x points noise samples push a noise resultant well below the
+    # floor — a single points-long trace is too few for a reliable verdict.
+    # A strongly saturating curve must ALSO show collinear deviations
+    # (require_structure): a constant LO-leakage phasor can fake the
+    # resultant but not the structure. A flat curve cannot be gated that
+    # way — leak and a genuinely rate-insensitive echo are
+    # indistinguishable in-band; the exp steps' echo_snr judge is the
+    # backstop if there is no echo at all.
+    judges = [phase_coherence(np.concatenate(sigs),
+                              require_structure=spread >= _STRUCTURED_SPREAD)]
+    if spread < _FLAT_SPREAD:
+        # Flatness establishes only the grid's measurement tolerance.
+        rec = float(rate_max)
+        session.stage_state('rep_rate',
+                            {'t1_eff_s': None, 'rep_rate_hz': rec,
+                             'mode': mode,
+                             'temperature_k': _phase_temperature(session)})
+        judges.append(JudgeReport(
+            'rep_rate_fit', True, 0.0,
+            {'note': f'flat within {spread:.1%} — no saturation resolved across '
+                     'the grid; using the fastest tested rate '
+                     '(5% flatness tolerance, not a <1% recovery bound)'}))
+        return ({'t1_eff': None, 't1_eff_s': None, 'rep_rate_hz': rec,
+                 'mode': mode, 'data_file': curve_path, 'live_data_file': history_path}, judges)
+
+    def model(T, a0, t1):
+        return a0 * (1.0 - np.exp(-T / t1))
+
+    # characteristic-time seed: shortest period already at (1 - 1/e) of the
+    # plateau (periods[] is descending — sort ascending for the scan)
+    order = np.argsort(periods)
+    knee = (1.0 - 1.0 / np.e) * a_max
+    above = np.nonzero(amps[order] >= knee)[0]
+    t1_0 = float(periods[order][above[0]]) if above.size else float(periods.max() / 3)
+    try:
+        p, _ = curve_fit(model, periods, amps, p0=[a_max, t1_0],
+                         bounds=([0, periods.min() * 1e-3],
+                                 [np.inf, periods.max() * 1e3]),
+                         maxfev=20000)
+    except (RuntimeError, ValueError) as e:
+        judges.append(JudgeReport('rep_rate_fit', False, 0.0,
+                                  {'note': f'saturation fit failed: {e}'}))
+        return ({'t1_eff': None, 't1_eff_s': None, 'rep_rate_hz': None,
+                 'mode': mode, 'data_file': curve_path, 'live_data_file': history_path}, judges)
+    a0, t1_eff = float(p[0]), float(p[1])
+    quality = fit_quality(amps, model(periods, *p), n_params=2)
+    judges.append(quality)
+    if not quality.passed:
+        judges.append(JudgeReport(
+            'rep_rate_fit', False, quality.score,
+            {**quality.details, 'note': 'saturation fit is not reliable; increase averaging '
+                                      'or adjust the rate range'}))
+        return ({'t1_eff': None, 't1_eff_s': None, 'rep_rate_hz': None,
+                 'mode': mode, 'data_file': curve_path, 'live_data_file': history_path}, judges)
+
+    residual = math.exp(-periods.max() / t1_eff)
+    covered = residual < _COVERAGE_RESIDUAL
+    if not covered:
+        advice = ('lower rate_min, but not below 10 Hz' if rate_min > 10
+                  else 'recovery is not covered at the 10 Hz tuning limit')
+        # the slowest rate is itself still saturated: T1_eff extrapolates
+        # beyond the grid — do NOT store a recommendation off it
+        judges.append(JudgeReport(
+            'rep_rate_fit', False, t1_eff,
+            {'note': f'grid fully saturated — the slowest period '
+                     f'{periods.max() * 1e3:.3g} ms still holds '
+                     f'{residual:.0%} residual saturation at T1_eff '
+                     f'{t1_eff * 1e3:.3g} ms; {advice}'}))
+        return ({'t1_eff': None, 't1_eff_s': t1_eff, 'rep_rate_hz': None,
+                 'mode': mode, 'data_file': curve_path, 'live_data_file': history_path}, judges)
+
+    rec = _recommend_rate(t1_eff, factor, mode, rate_max, session.log)
+    from atomize.epr_auto.primitives.exp import _fmt_s   # lazy: exp imports tune
+    session.stage_state('rep_rate',
+                        {'t1_eff_s': t1_eff, 'rep_rate_hz': rec, 'mode': mode,
+                         'temperature_k': _phase_temperature(session)})
+    judges.append(JudgeReport('rep_rate_fit', True, t1_eff,
+                              {'residual_at_slowest': round(residual, 4),
+                               'rep_rate_hz': rec}))
+    result = {'t1_eff': _fmt_s(t1_eff), 't1_eff_s': t1_eff,
+              'rep_rate_hz': rec, 'amplitude_plateau': round(a0, 4),
+              'mode': mode, 'data_file': curve_path, 'live_data_file': history_path}
+    session.log(f'      T1_eff {_fmt_s(t1_eff)} -> rep_rate {rec:g} Hz ({mode})')
+    return result, judges
+
+
+# --------------------------------------------------------- pi calibration
+
+def _nutation_model(x, a, b, s, k, c0):
+    return a * np.cos(b * x + s * x ** 2) * np.exp(-k * x) + c0
+
+
+def _smooth(y, w=None):
+    if w is None:
+        w = max(3, len(y) // 20)
+    w = max(1, int(w)) | 1
+    return np.convolve(y, np.ones(w) / w, mode='same')
+
+
+def _theta_root(b, s, target):
+    """Smallest positive x with b*x + s*x^2 == target (None if unreachable)."""
+    if abs(s) < 1e-12:
+        return target / b if b > 0 else None
+    disc = b * b + 4 * s * target
+    if disc < 0:
+        return None
+    roots = [r for r in ((-b + math.sqrt(disc)) / (2 * s),
+                         (-b - math.sqrt(disc)) / (2 * s)) if r > 0]
+    return min(roots) if roots else None
+
+
+def _oriented_fit(x, y):
+    """auto_phase_zero's principal axis is sign-blind, so the rotated trace
+    can come out as -cos(theta); the model has no phase-offset term, so a
+    flipped trace is unfittable and would poison the argmin fallback (the
+    -cos minimum sits at theta=0). Resolve the orientation from the leading
+    points — theta(x[0]) < pi/2 in the nutation presets, so a +cos trace
+    starts positive — and fit; flip as a rescue only if that fit fails.
+    (Fitting both and comparing SSR is NOT safe: the quadratic theta term
+    can absorb a pi offset over a finite window, yielding a plausible-SSR
+    fit with garbage roots.) Returns (oriented_y, popt, y_fit)."""
+    if np.mean(y[:max(3, len(y) // 10)]) < 0:
+        y = -y
+    popt, y_fit = _fit_nutation(x, y)
+    if popt is None:
+        popt, y_fit = _fit_nutation(x, -y)
+        if popt is not None:
+            y = -y
+    return y, popt, y_fit
+
+
+# physical bounds on the fractional chirp r = s*x_max/b (theta' at the sweep
+# end = b*(1+2r)): amplifier compression only SLOWS the rotation, moderately —
+# without this bound the fit has a second basin (small b, large positive s:
+# an accelerating chirp) that matches ~1.5 periods with a plausible SSR but a
+# completely wrong theta shape between 0 and pi, wrecking the pi/2 root.
+_R_MIN, _R_MAX = -0.35, 0.15
+
+
+def _fit_nutation(x, y):
+    """Fit y = a*cos(theta)*exp(-k*x) + c0, theta = b*x + s*x^2, with the
+    chirp fitted as the bounded fraction r = s*x_max/b (see _R_MIN/_R_MAX).
+    Returns ((a, b, s, k, c0), y_fit) or (None, None) on no convergence."""
+    x_max = float(x[-1])
+    ys = _smooth(y)
+    x_min = x[int(np.argmin(ys))]
+    if x_min <= x[0]:
+        x_min = x[len(x) // 2]        # minimum at the left edge: bad seed
+    p0 = [(ys.max() - ys.min()) / 2, math.pi / x_min, 0.0, 0.0, float(ys.mean())]
+    span = float(x[-1] - x[0]) or 1.0
+    bounds = ([0, 1e-6 / span, _R_MIN, 0, -np.inf],
+              [np.inf, np.inf, _R_MAX, 10 / span, np.inf])
+
+    def model_r(xx, a, b, r, k, c0):
+        return a * np.cos(b * xx * (1 + r * xx / x_max)) * np.exp(-k * xx) + c0
+
+    try:
+        p, _ = curve_fit(model_r, x, y, p0=p0, bounds=bounds, maxfev=20000)
+    except (RuntimeError, ValueError):
+        return None, None
+    a, b, r, k, c0 = p
+    popt = (a, b, b * r / x_max, k, c0)          # callers see (a,b,s,k,c0)
+    return popt, _nutation_model(x, *popt)
+
+
+def _refine_minimum(x, y, x0, half_width):
+    """Local parabola through the raw data around x0 -> vertex. The extremum
+    position is model-independent (invariant under the theta(x) mapping), so
+    this de-biases pi against the fit's s/k degeneracy."""
+    # keep the window symmetric: a window clipped by the sweep edge skews
+    # the parabola vertex
+    half_width = min(half_width, x0 - x[0], x[-1] - x0)
+    m = (x >= x0 - half_width) & (x <= x0 + half_width)
+    if m.sum() < 5:
+        return x0
+    c = np.polyfit(x[m], y[m], 2)
+    if c[0] <= 0:                      # not minimum-shaped: keep the fit root
+        return x0
+    v = -c[1] / (2 * c[0])
+    return float(v) if x0 - half_width <= v <= x0 + half_width else x0
+
+
+def _anchored_pi2(x, y, x_pi, popt):
+    """pi/2 via an anchored re-fit: pin theta(x_pi) = pi at the (model-free)
+    refined minimum, i.e. s = (pi - b*x_pi)/x_pi^2, and re-fit the rest.
+    Pinning the theta map at the measured extremum removes the baseline /
+    envelope degeneracy from the pi/2 root, which then comes out as reliably
+    as pi itself (benchmark: sd ~0.4 vs ~2.4 units for the free fit's root).
+    Returns None when the re-fit does not converge."""
+    a0, b0, s0, k0, c00 = popt
+    span = float(x[-1] - x[0]) or 1.0
+    x_max = float(x[-1])
+    # the anchor makes s a function of b, so the physical chirp bound
+    # r = s*x_max/b in [_R_MIN, _R_MAX] becomes a b range (r decreases in b)
+    b_lo = math.pi * x_max / (x_pi * (_R_MAX * x_pi + x_max))
+    b_hi = math.pi * x_max / (x_pi * (_R_MIN * x_pi + x_max))
+
+    def model(xx, a, b, k, c0):
+        s = (math.pi - b * x_pi) / x_pi ** 2
+        return a * np.cos(b * xx + s * xx ** 2) * np.exp(-k * xx) + c0
+
+    try:
+        p, _ = curve_fit(model, x, y,
+                         p0=[a0, min(max(b0, b_lo), b_hi), max(k0, 1e-9), c00],
+                         bounds=([0, b_lo, 0, -np.inf],
+                                 [np.inf, b_hi, 10 / span, np.inf]),
+                         maxfev=20000)
+    except (RuntimeError, ValueError):
+        return None
+    b = p[1]
+    return _theta_root(b, (math.pi - b * x_pi) / x_pi ** 2, math.pi / 2)
+
+
+def _scale_detection_pair(pre, slot, pi_v, pi2_v, l_cal, log):
+    """Soft/selective detection pair re-scaling after a fine amplitude cal
+    (ARCHITECTURE.md 'Detection pulses'): pair = active MW pulses (not the
+    swept slot) at >= _SOFT_LEN_RATIO x the swept pulse's length, roles by
+    relative amplitude (lower = pi/2); flip angle ~ amp * L * <envelope>, so
+    amp_det(theta) = amp_cal(theta) * (L*f)_cal / (L*f)_det with f the
+    envelope area factor (the amp is nearly linear). Returns
+    {slot_index: {role, amplitude, length_ns}}, empty when there is no
+    recognizable pair (preset-stored values stay in force)."""
+    swept_len = pre.slots[slot].length
+    pair = [(i, s) for i, s in enumerate(pre.slots)
+            if i > 0 and i != slot and s.active
+            and s.typ not in ('BLANK', 'LASER')
+            and s.length >= _SOFT_LEN_RATIO * swept_len]
+    if not pair or l_cal is None:
+        return {}
+    f_cal = _slot_area(pre.slots[slot], pre.awg_grid)
+    coefs = sorted({s.coef for _, s in pair})
+    if len(pair) == 1:
+        roles = {pair[0][0]: 'pi'}          # single refocusing pulse
+    elif len(coefs) == 2:
+        roles = {i: ('pi2' if s.coef == coefs[0] else 'pi') for i, s in pair}
+    else:
+        log('      detection pair: amplitudes indistinguishable — '
+            'preset-stored values left in force')
+        return {}
+    out = {}
+    for i, s in pair:
+        f_det = _slot_area(s, pre.awg_grid)
+        if f_cal is None or f_det is None:
+            log(f'      detection pair: no envelope area factor for '
+                f'{pre.slots[slot].typ} -> P{i + 1} ({s.typ}) — '
+                'preset-stored values left in force')
+            return {}
+        amp = ((pi_v if roles[i] == 'pi' else pi2_v)
+               * float(l_cal) * f_cal
+               / (snapshot._snap(s.length, pre.awg_grid) * f_det))
+        if amp > 100.0:
+            log(f'      detection pair: P{i + 1} would need {round(amp, 2)}% '
+                '(> 100%) — preset-stored values left in force')
+            return {}
+        out[i] = {'role': roles[i], 'amplitude': round(amp, 2),
+                  'length_ns': s.length}
+    return out
+
+
+def pi_calibration(session, preset, mode='amplitude', channel='AWG',
+                   points=None, scans=None, step=None, hold_amplitude=None,
+                   refine=False, _pair_override=None, _stage=True):
+    """Fine stage: nutation curve of the swept pulse -> amp/length of pi and
+    pi/2, extracted independently through the theta(x) = b*x + s*x^2 fit.
+
+    mode='amplitude': Amplitude-sweep preset, axis in % of AWG full scale
+    (step overrides the preset's Amplitude Step). mode='length': linear-time
+    nutation preset, axis converted to ns. hold_amplitude overrides the swept
+    pulse's amplitude coefficient (used by power_for_length).
+
+    After every amplitude-mode cal the soft detection pair is re-scaled by
+    the standard inverse-length rule (result key 'detection_pair'; the first
+    pass always runs the preset-stored pair — the nutation extremum position
+    is first-order independent of pair errors). refine=True re-runs the
+    nutation once with the re-scaled pair patched in (_pair_override is that
+    recursion's internal channel). _stage=False (power_for_length's internal
+    probe) skips the session-state staging so the probe never leaks into
+    state['pi_calibration']."""
+    if channel != 'AWG':
+        raise ValueError('only the AWG channel is supported (RECT is a later phase)')
+
+    want = 'Amplitude' if mode == 'amplitude' else 'Linear Time'
+    pre_probe = snapshot.load_preset(preset)
+    if pre_probe.sweep_type != want:
+        raise ValueError(f'{preset}: mode {mode!r} needs a {want!r} preset, '
+                         f'got {pre_probe.sweep_type!r}')
+    slot = _swept_slot(pre_probe, mode)
+
+    coef_overrides = []
+    if hold_amplitude is not None:
+        coef_overrides.append((slot, hold_amplitude))
+    if _pair_override:
+        coef_overrides.extend(_pair_override.items())
+    pre, wa = _build(session, pre_probe, exp_name='PiCal',
+                     slot_coef=coef_overrides or None,
+                     points=points, scans=scans, step_ampl=step)
+    sweep = pre.sweep_type
+    acq = _acquire(session, wa, sweep, f'pi_cal_{mode}', log=session.log)
+    unit = '%' if mode == 'amplitude' else 'ns'
+    # the swept pulse's fixed quantity, needed to transfer the calibration to
+    # pulses of a different length (apply_cal's inverse-length amplitude scaling)
+    if mode == 'amplitude':
+        f_cal = _slot_area(pre.slots[slot], pre.awg_grid)
+        context = {'length_ns': snapshot._snap(pre.slots[slot].length,
+                                               pre.awg_grid),
+                   'shape_typ': pre.slots[slot].typ,
+                   'shape_factor': round(f_cal, 6) if f_cal is not None else None}
+    else:
+        context = {'held_amplitude': pre.slots[slot].coef}
+
+    if acq is None:
+        pi_v, pi2_v = _CANNED_PI, _CANNED_PI2
+        result = {'pi': pi_v, 'pi2': pi2_v, 'unit': unit, 'mode': mode,
+                  'ratio': round(pi_v / pi2_v, 3), 'rails': None,
+                  'canned': True, **context}
+        det = {} if mode != 'amplitude' else _scale_detection_pair(
+            pre, slot, pi_v, pi2_v, context.get('length_ns'), session.log)
+        if det:
+            result['detection_pair'] = {f'P{i + 1}': dict(v)
+                                        for i, v in det.items()}
+        if _stage:
+            session.stage_state('pi_calibration', result)
+        judges = [pi_ratio_linearity(pi_v, pi2_v)]
+        if mode == 'amplitude':
+            judges.append(amplitude_rails(pi_v))
+        if refine and det and _pair_override is None:
+            # dry-run still exercises the refine plumbing: the recursion
+            # pre-flights the pair-patched preset through the engine
+            session.log('      refine: would re-run the nutation with the '
+                        're-scaled detection pair')
+            return pi_calibration(session, preset, mode, channel, points,
+                                  scans, step, hold_amplitude, refine=False,
+                                  _pair_override={i: v['amplitude']
+                                                  for i, v in det.items()},
+                                  _stage=_stage)
+        return result, judges
+
+    x, i, q, path = acq
+    if mode == 'length':
+        x = x * 1e9                    # worker saves the time axis in seconds
+    sig = i + 1j * q
+
+    judges = [echo_snr(sig)]
+    y, popt, y_fit = _oriented_fit(x, _to_real(sig))
+    if popt is not None:
+        a_f, b, s, k_f, c0_f = popt
+        judges.append(fit_quality(y, y_fit, n_params=5))
+        pi_v = _theta_root(b, s, math.pi)
+        pi2_v = _theta_root(b, s, math.pi / 2)
+        # de-bias vertex/anchor on the envelope-corrected trace: the raw damped cosine's minimum sits before theta = pi
+        if pi_v is not None and pi_v <= x[-1]:
+            yc = (y - c0_f) * np.exp(k_f * x)
+            w = (math.pi / 2) / (b + 2 * s * pi_v) if (b + 2 * s * pi_v) > 0 else 0
+            if w > 0:
+                pi_v = _refine_minimum(x, yc, pi_v, w)
+            anchored = _anchored_pi2(x, yc, pi_v, (a_f, b, s, 0.0, 0.0))
+            if anchored is not None:
+                pi2_v = anchored
+    else:
+        # fallback: direct extremum / zero crossing on the smoothed curve,
+        # oriented by the leading points (theta(x[0]) < pi/2 in the presets,
+        # so a +cos trace starts positive)
+        judges.append(JudgeReport('fit_quality', False, 0.0,
+                                  {'note': 'nutation fit did not converge; '
+                                           'direct extremum used'}))
+        if np.mean(y[:max(3, len(y) // 10)]) < 0:
+            y = -y
+        ys = _smooth(y)
+        pi_v = float(x[int(np.argmin(ys))])
+        c0 = (ys.max() + ys.min()) / 2
+        below = np.nonzero(ys < c0)[0]
+        pi2_v = float(x[below[0]]) if below.size else None
+
+    rails = None
+    if pi_v is None or pi_v > x[-1]:
+        # pi not reached within the sweep: x[-1] is a lower bound (still
+        # usable as a direction for the coarse-stage vane math)
+        rails, pi_v = 'high', float(x[-1])
+    if pi2_v is not None and pi2_v > x[-1]:
+        # a pi/2 root beyond the sweep is extrapolation, not a measurement
+        rails, pi2_v = rails or 'high', None
+    if mode == 'amplitude':
+        rail_judge = amplitude_rails(100.0 if rails == 'high' else pi_v)
+    else:
+        rail_judge = length_rails(pi_v, float(x[0]), float(x[-1]))
+    judges.append(rail_judge)
+    if not rail_judge.passed:
+        rails = rails or rail_judge.details.get('rail')
+
+    pi_v = round(float(pi_v), 2) if pi_v is not None else None
+    pi2_v = round(float(pi2_v), 2) if pi2_v is not None else None
+    result = {'pi': pi_v, 'pi2': pi2_v, 'unit': unit, 'mode': mode,
+              'ratio': round(pi_v / pi2_v, 3) if pi_v and pi2_v else None,
+              'rails': rails, 'data_file': path, **context}
+    if pi_v and pi2_v:
+        judges.append(pi_ratio_linearity(pi_v, pi2_v))
+    # standard post-cal detection-pair re-scaling (skipped on a rail: the
+    # measured amplitudes do not describe a valid rotation)
+    if mode == 'amplitude' and rails is None and pi_v and pi2_v:
+        det = _scale_detection_pair(pre, slot, pi_v, pi2_v,
+                                    context.get('length_ns'), session.log)
+        if det:
+            result['detection_pair'] = {f'P{i + 1}': dict(v)
+                                        for i, v in det.items()}
+            if refine and _pair_override is None:
+                if _stage:
+                    session.stage_state('pi_calibration', result)
+                session.log('      refine: re-running the nutation with the '
+                            're-scaled detection pair')
+                return pi_calibration(session, preset, mode, channel, points,
+                                      scans, step, hold_amplitude,
+                                      refine=False,
+                                      _pair_override={i: v['amplitude']
+                                                      for i, v in det.items()},
+                                      _stage=_stage)
+    if _stage:
+        session.stage_state('pi_calibration', result)
+    return result, judges
+
+
+# ------------------------------------------------------- power for length
+
+def _vane_db(mw):
+    ans = str(mw.mw_bridge_rotary_vane())
+    try:
+        return float(ans.replace('dB', '').strip().split()[-1])
+    except (ValueError, IndexError):
+        raise RuntimeError(f'cannot parse rotary vane answer {ans!r}') from None
+
+
+def _vane_set(session, target_db, overshoot=1.0):
+    """Move the vane with the same-direction (from-above) approach to kill
+    backlash, and wait out the mechanical move (36 ms/motor-step via the
+    device's own calibration curve) — the vane must be at rest before the
+    next acquisition starts in a separate worker process."""
+    mw = session.mw_bridge
+    target_db = round(float(target_db), 1)
+    prev = _vane_db(mw)                # one read; track position locally
+    seq = [target_db] if target_db <= prev else \
+        [min(target_db + overshoot, 60.0), target_db]
+    for db in seq:
+        mw.mw_bridge_rotary_vane(db)
+        if not session.test:
+            wait_s = abs(36.0 * (mw.calibration(db) - mw.calibration(prev))) / 1000.0
+            time.sleep(wait_s + 0.2)
+        prev = db
+    return target_db
+
+
+def power_for_length(session, target_length, amplitude=95.0,
+                     preset=None, tolerance='3.2 ns', max_iter=4,
+                     rehome='no'):
+    """Coarse stage: step the rotary vane until pi (measured by a length
+    nutation at the held AWG amplitude) lands at the target length.
+    B1 scales as 10^(-dB/20), so each iteration jumps
+    dB += 20*log10(target/measured). Any vane move invalidates auto-phase
+    and the fine calibration (session state) — re-run them after."""
+    from atomize.epr_auto.params import parse_time_ns
+    if preset is None:
+        raise ValueError('power_for_length needs a length-nutation preset path')
+    target_ns = parse_time_ns(target_length)
+    tol_ns = parse_time_ns(tolerance)
+    mw = session.mw_bridge
+
+    if rehome == 'limit' and not session.test:
+        mw.mw_bridge_rotary_vane(60.0, mode='Limit')   # true re-home at a switch
+        time.sleep(8.0)
+        session.invalidate_fine_calibrations('vane re-home')
+
+    lengths, atten_history, last_cal_judges = [], [_vane_db(mw)], []
+    for it in range(1, max_iter + 1):
+        result, cal_judges = pi_calibration(
+            session, preset, mode='length', hold_amplitude=amplitude,
+            _stage=False)
+        if result.get('canned'):
+            # dry-run: pretend the first measurement already hit the target
+            res = {'attenuation_db': atten_history[-1],
+                   'pi_length': f'{target_ns} ns', 'target_length': target_length,
+                   'iterations': 1, 'canned': True}
+            return res, [JudgeReport('pi_length_target', True, target_ns,
+                                     {'note': 'dry-run, not judged'})]
+
+        last_cal_judges = list(cal_judges)
+        for j in cal_judges:
+            session.log(f'        nutation {j}')
+        snr_j = next((j for j in cal_judges if j.name == 'echo_snr'), None)
+        if snr_j is not None and not snr_j.passed:
+            # no echo: an argmin-of-noise pi must never command a vane move
+            raise RuntimeError(f'no echo in the length nutation (iteration '
+                               f'{it}): {snr_j} — not moving the vane on noise')
+        measured = result['pi']
+        if measured is None:
+            raise RuntimeError('length nutation did not yield a pi length '
+                               f'(iteration {it})')
+        lengths.append(measured)
+        session.log(f'      iteration {it}: pi = {measured} ns '
+                    f'@ {atten_history[-1]} dB (target {target_ns} ns)')
+        if abs(measured - target_ns) <= tol_ns:
+            break
+        if it == max_iter:
+            # out of iterations: do NOT move the vane past the last
+            # measurement — the reported (attenuation, pi_length) pair must
+            # describe the state the vane is actually in
+            break
+        new_db = atten_history[-1] + 20.0 * math.log10(target_ns / measured)
+        new_db = _vane_set(session, min(max(new_db, 0.0), 60.0))
+        atten_history.append(new_db)
+        session.invalidate_fine_calibrations(f'vane -> {new_db} dB')
+
+    final = lengths[-1]
+    on_target = abs(final - target_ns) <= tol_ns
+    # the last nutation's judges ride along: the manifest records the evidence
+    judges = [JudgeReport('pi_length_target', on_target, final,
+                          {'target_ns': target_ns, 'tol_ns': tol_ns})] \
+        + last_cal_judges
+    if not on_target and len(lengths) >= 2:
+        # diagnostic for the failure only: on success the target judge is the
+        # gate (a single large-but-correct vane jump is not a defect)
+        judges.append(convergence(lengths, tol=tol_ns / target_ns))
+    result = {'attenuation_db': atten_history[-1], 'pi_length': f'{final} ns',
+              'target_length': target_length, 'iterations': len(lengths)}
+    session.stage_state('power_for_length', result)
+    return result, judges

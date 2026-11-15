@@ -1,0 +1,158 @@
+# AGENTS.md
+
+Repository instructions for Codex and other coding agents working in Atomize_stations/itc. Adapted from `CLAUDE.md`; keep shared project facts consistent when updating either guide.
+
+## Working rules
+
+- Keep planning, decisions, architecture, and final review in the main session with the user. When the session supports delegation, give independent searches, repetitive edits, boilerplate, or log analysis to subagents. Use available models appropriate to the task: lighter models for searches and mechanical work, capable coding models for implementation. Do small, tightly coupled tasks directly.
+- Always look for the simplest solution first, and prefer it. The smallest change that solves the actual problem beats a bigger design. Extend existing patterns before inventing new ones. No new dependencies or moving parts without a real reason.
+- For multi-step work, keep a short checklist current using the plan/todo tool when available, otherwise a concise progress update. Show what is done and what remains.
+- When you spawn a subagent, tell me at that moment: which model it runs on and what it is doing. Report what it came back with when it finishes.
+- Never use Haiku. Do not assume Claude model names are available in a Codex session.
+- Comments: never multi-line. Omit the comment entirely when the code is obvious; otherwise one short line. Explain a fix in the commit message and the review/roadmap docs, not in the source. Docstrings are exempt (long explanatory docstrings are house style) but keep new ones tight.
+- No over-explaining: Deliver the exact output requested. Do not narrate internal steps or show reasoning chains. Do not use programming jargon.
+- Strict scope control: Stop when the requested task is complete. Do not expand, refactor unrequested areas, or suggest extra features.
+- When committing, use one cohesive commit per repository for the requested task. Preserve unrelated user changes and do not rewrite existing commits without authorization.
+
+## What this repo is
+
+`Atomize_stations/itc` is the ITC EPR-endstation station for [Atomize](https://github.com/Anatoly1010/Atomize) — a modular instrument-control framework for spectrometers. It installs on top of the core (`atomize-py>=0.5`, sibling repo `../../Atomize`) and holds only ITC's own files, which join the core's under the same `atomize` name; `atomize/station.py` declares the station. Shared code (main window, Liveplot, device, general and math modules) lives in the core and is changed there. It extends upstream Atomize with an "EPR Endstation Control" tab in the main window (`atomize/main/main.py`), Insys FM214x3GDA FPGA support (DAC / ADC / TTL pulser via ctypes against `libs/lib*.so`), and a set of dedicated control-center subprocesses (CW EPR, TR EPR, oscilloscopes, MW bridge, magnetic field, temperature, resonator tuning, RECT/AWG phasing).
+
+Python is the scripting language. Experimental scripts are ordinary Python files that import device-module classes and call `general` functions to push data to the LivePlot-based GUI.
+
+## Common commands
+
+**Two machines.** Development happens on **Windows**, where the interpreter is
+`python` (there is no `python3` on PATH) and the shell is PowerShell. The
+spectrometer box that drives the hardware runs **Linux**, where it is `python3`
+only. Anything that touches `libs/lib*.so`, the Insys FPGA or the SpinCore board
+can only run for real on the Linux box; on Windows use test mode (see below).
+Substitute the right interpreter for the platform you are on.
+
+Install the core first (`pip install -e "../../Atomize[serial,modbus,math,bots]"`), then this folder
+(`pip install -e .`). The optional extras are the core's; the `atomize-itc` /
+`epr-auto` entry points are defined in this folder's `pyproject.toml` — read it rather than
+trusting a copy here. The invocations that are NOT guessable from the manifest:
+
+```bash
+python -m atomize path/to/script.py    # launch the GUI and open a script in it
+python path/to/script.py test          # smoke-test one script, no GUI (see "Test mode")
+python -m atomize.epr_auto run <protocol>.yaml --test   # protocol runner, dry-run
+```
+
+There is no unit-test suite; the project's pre-flight check is **test mode** (see "Test mode" below). Example/demo scripts live in `atomize/script_examples/` (not `atomize/tests/` — that path in the upstream README is stale here).
+
+## Big-picture architecture
+
+### Multi-process model
+
+The GUI is **one Qt process that spawns many `QProcess` children**, not a monolithic event loop:
+
+- `atomize/main/main.py:MainExtended` — extends the upstream `MainWindow` with a third tab ("EPR Endstation Control"). Each control-center button (`start_tr_control`, `start_osc_control`, `start_cw`, `start_field_control`, `start_temp_control`, `start_mw_control`, `start_tune_preset`, `start_rect_phasing`, `start_awg_phasing`, …) launches a script under `atomize/control_center/` via a dedicated `QProcess` (`process_tr`, `process_osc`, etc.).
+- `start_experiment` in `main.py` spawns the user's experimental script in `self.process_python`.
+- Children communicate **upward** by writing `print "..."` to stdout; the parent's `handle_output*` parses lines prefixed with `print `, `before `, `closing `, or `ret = 0` and routes them to the in-app log (`text_errors`). The `before ` / `ret = 0` sentinels exist specifically to suppress Insys FPGA driver chatter.
+- The parent communicates **downward** to the active script by writing JSON-ish responses to its stdin when the child prints `create_file_dialog` / `open_file_dialog` — this is how scripts trigger native file pickers.
+
+When editing anything in `atomize/main/main.py` or the control-center scripts, remember every `general.message(...)` call becomes a `print` over a pipe — don't replace it with a normal `print` or it'll be eaten by the routing logic.
+
+### LivePlot data path
+
+Plotting is a second IPC layer parallel to stdout:
+
+- The main window starts a `QLocalServer` named `LivePlot` (`atomize/main/main_window.py`).
+- Each child script imports `atomize.general_modules.general_functions`, which instantiates a `LivePlotClient` (`atomize/main/client.py`). The client connects to the local socket, allocates a `QSharedMemory` block, and sends NumPy array payloads via shared memory plus a JSON metadata header over the socket.
+- The main window's `accept` / `read_from` callbacks attach to the same shared memory and forward to the pyqtgraph DockArea.
+
+This is why `general.plot_1d(...)` only works when called from a script launched **through** the main window — outside of that, the `LivePlotClient` constructor raises `EnvironmentError("Couldn't find LivePlotter instance")`.
+
+### Device module convention
+
+Every device gets a parallel pair:
+
+- `atomize/device_modules/<Device>.py` — class named the same as the file, instantiated by experimental scripts (`import atomize.device_modules.Lakeshore_335 as ls; ls335 = ls.Lakeshore_335()`).
+- `atomize/device_modules/config/<Device>_config.ini` — sectioned config (`DEFAULT`, `GPIB`, `SERIAL`, `MODBUS`, `ETHERNET`, `SPECIFIC`). The `DEFAULT.type` field (`gpib` / `rs232` / `ethernet` / `modbus`) picks which section is used at connect time.
+
+`atomize/device_modules/config/config_utils.py` has the shared `read_conf_util` / `read_specific_parameters` helpers that every device module calls. Transport layers: pyvisa (GPIB/RS-232/Ethernet/VXI-11), pyserial directly, minimalmodbus, raw sockets for TCP/UDP, and **ctypes** for vendor binaries — `libs/libNvsbLib.so`, `libs/libConfigGIM.so`, `libs/GIM.so`, `libs/libbambpex.so` (Insys FPGA) and `atomize/general_modules/libspinapi.so` (SpinCore Pulse Blaster).
+
+When adding a new device, model after an existing one of the same transport class (e.g. copy `Lakeshore_335.py` for a new GPIB/RS-232 device) and add its config file. The class name **must** match the module filename.
+
+### Test mode (the pre-flight check)
+
+In lieu of a unit-test suite, the whole framework has a **test mode** toggled by the first CLI argument. `general_functions.py` reads `test_flag = sys.argv[1]` at import; `is_test()` is `test_flag == 'test'`. Device modules do the same in `__init__` (`self.test_flag = sys.argv[1]`). The GUI's `Test Scripts` checkbox re-launches the experimental script with `argv[1] == 'test'`, so ticking it exercises this path for the whole run.
+
+What test mode does — it is **more than a syntax/import check**:
+
+- **No real I/O.** Every device-module function guards its hardware access with `if self.test_flag != 'test':`. In the `elif self.test_flag == 'test':` branch it instead returns canned values (e.g. `Insys_FPGA.py` sets `test_rep_rate_pulser = '200 Hz'`, `test_sample_rate_adc = '2500 MHz'`, …) so the script runs end-to-end with no board attached.
+- **Argument validation.** Those `elif ... == 'test':` branches also range-check and type-check their arguments and raise on bad input — so running under test mode surfaces illegal pulse lengths, out-of-range settings, sequence-overlap asserts, etc. before they ever reach hardware. This is why the phasing tools spin up a *throwaway* test-mode `Insys_FPGA()` to validate a live edit (see "Pulse-EPR experiment presets").
+- **Message / plot twins.** `general.message(...)`/`general.plot_1d(...)` have `_test`-suffixed counterparts (`message_test`, `plot_1d_test`, `plot_2d_test`). The `_test` variants fire **only** in test mode and the plain ones **only** in a real run — use `message_test(...)` for diagnostics you want during the pre-flight check but not during acquisition.
+
+When adding hardware-touching code, always preserve the `argv[1] == 'test'` branch — omitting it means the script can't be pre-flighted and will try to talk to absent hardware in test mode.
+
+### Config-file lifecycle (important gotcha)
+
+`atomize/main/local_config.py:copy_config` runs on every startup and copies:
+- `atomize/config.ini` (the core's, then this station's on top) → `<user_config_dir>/atomize-itc/main_config.ini`
+- `atomize/device_modules/config/*` (the core's, then this station's on top) → `<user_config_dir>/atomize-itc/device_config/`
+
+…but **only if** the user config directory is missing or empty. After first launch, device modules read from the user-config copy (via `lconf.load_config_device()`), not the repo copy. Editing `atomize/device_modules/config/Foo_config.ini` in-repo will **not** affect a running install; inspect the active file under `user_config_dir("atomize-itc")/device_config/` when diagnosing configuration issues. Preserve machine-specific settings; do not wipe the user configuration directory as a routine fix. On Windows this is typically `%LOCALAPPDATA%\atomize-itc\atomize-itc\` (resolved by `platformdirs`).
+
+The core's `atomize/main/main_window.py` also `os.chdir`'s into this station's `libs/` (`lconf.ROOT_DIR`, passed by `main.py`) early in startup, so any relative paths after that point are resolved against `libs/`. The `libs/status` file and `*.param` files (`field.param`, `bridge.param`, `digitizer*.param`, `correction.param`) are runtime IPC files between control-center widgets and other processes — they're git-ignored and intentionally mutated at runtime.
+
+### Pulse-EPR experiment presets
+
+`atomize/control_center/experiments/*.phase` and `*.phase_awg` are saved phase-cycle/pulse-sequence presets consumed by the phasing/tune control scripts (`phasing_insys.py`, `awg_phasing_insys.py`, `tune_preset.py`, etc.). The `_insys` suffix in `atomize/control_center/other_versions/` marks Insys-FPGA-specific variants; non-suffixed siblings target Spectrum / oscilloscope hardware.
+
+**Live edit.** The Insys phasing tools (`phasing_insys.py`, `awg_phasing_insys.py`) can re-arm a *running* sequence without restarting the experiment. Editing a pulse parameter, with "Live mode" on, pushes the change to the acquisition worker after a debounced "Apply delay" instead of tearing down and rebuilding the scan. Supporting pieces:
+
+- **Settings tab** holds the Live/Apply-delay controls. The **Pulses tab Link row** holds the parameter selector, a × reset button, and per-pulse No/0.5×/1×/2× factors. Switching parameters retains the factors; Off temporarily disables linking; × resets the parameter to Off and all factors to No without changing pulse values.
+- Not every change can be applied in place: a change to the phase-cycle *structure* (number of steps, per-pulse phase text) forces an announced restart rather than a silent no-op — the tool hashes the sequence structure to decide. Loading a preset or pressing Open while a preview is live stops that preview first.
+- **Worker-side validation.** Before accepting a live edit the worker rebuilds the sequence under a throwaway **test-mode** `Insys_FPGA()` (see "Test mode") so the overlap/length asserts — which only fire in test mode — reject an illegal edit as `('LiveReject', reason)`; the GUI shows the reason and keeps the previous sequence running.
+- The AWG DETECTION-pulse frequency also re-arms live: it only drives the per-scan `digitizer_demodulate` demod (`iq_freq`), not an AWG waveform.
+
+### EPR automation layer (`atomize/epr_auto/`) — mirror rule
+
+`atomize/epr_auto/` is the protocol-runner/automation layer (design + roadmap in `docs/automation/`). Its engine does **not** duplicate the phasing tool: `engine/executor.py` runs the very same `Worker` class from `awg_phasing_insys.py`, and `engine/snapshot.py` re-implements only the GUI's snapshot pipeline — preset parsing (`open_file`/`setter` line indices), value formatting (grid snap — 3.2 ns default / 0.8 ns for fine-grid presets with a trailing `AWG grid:  0.8` line, `' ns'`/`' MHz'` strings, `TimeLogSpinBox` log-grid), `expand_phase_cycling`, unit conversions, and the `dig_start_exp`/`worker.exp*` argument packing.
+
+**Any change to the phasing GUIs (`awg_phasing_insys.py`, and `phasing_insys.py` once RECT support lands) that touches the preset format, the `update_*` value formatting, `expand_phase_cycling`, the `Worker` method signatures / pipe protocol, or the `dig_start_exp` argument packing MUST be mirrored in `atomize/epr_auto/engine/`, and the equivalence harness `~/epr_auto_dev/gui_vs_engine.py` re-run** — it drives the real GUI offscreen and diffs the built worker args against the engine for every preset in `atomize/control_center/experiments/`; it must report ALL PASS. That harness lives on the Linux box only; the fork-sync checker is `~/atomize_sync/sync_check.py` on Linux and `D:\Melnikov\11_Programming\atomize_sync\sync_check.py` on Windows.
+
+### General script-side API
+
+Experimental scripts almost always start with:
+
+```python
+import atomize.general_modules.general_functions as general
+import atomize.general_modules.csv_opener_saver as openfile
+```
+
+- `general.message(...)`, `general.message_test(...)` — print to the main-window log (and only in non-test / only-in-test runs respectively).
+- `general.wait('10 ms')` — string-with-unit time API used everywhere (`ks/s/ms/us/ns/ps`). Time arguments to device functions follow the same convention.
+- `general.plot_1d`, `general.plot_2d` — push to LivePlot.
+- `general.to_infinity()` — generator for `Stop`-button-aware infinite loops.
+- `general.bot_message(...)` — Telegram (requires token+chat-id in `main_config.ini`).
+- `atomize.general_modules.returned_thread.rThread` — `threading.Thread` subclass whose `join()` returns the target's return value; this is the project's standard concurrency primitive (see `atomize/documentation/concurrency.md`).
+- `openfile.Saver_Opener()` — CSV I/O with header support and Tk-style file dialogs.
+
+### Documentation
+
+The per-instrument function reference is Markdown in the core's `atomize/documentation/`. When changing a device module's public API, update the matching page there.
+
+The published documentation is built with MkDocs Material from `docs/` in the separate sibling repository `../../atomize_docs/`, at https://anatoly1010.github.io/atomize_docs/. Its legacy Jekyll tree is not deployed. Update the corresponding published reference when changing documented behavior, and read that repository's `AGENTS.md` before editing it.
+
+The EPR Endstation webpage (`../../atomize_docs/docs/projects/endstation.md`) contains only general information about the endstation. Do not add control-center UI details, widget behavior, or routine implementation changes to that page. A UI-only change does not require an addition to `atomize_docs` unless it changes behavior already documented there.
+
+For `epr_auto` step or parameter registration changes, regenerate the published `steps.md` from the runner registry rather than editing it by hand:
+
+```bash
+# Run from Atomize_stations/itc on Linux.
+python3 -m atomize.epr_auto.docgen /home/anatoly/atomize_docs/docs/projects/epr_auto/steps.md
+```
+
+Protocol-schema changes must also update `../../atomize_docs/docs/projects/epr_auto/protocols.md` in the same task. Keep preset, tuning, troubleshooting, and error-message descriptions consistent with the code. Run the strict MkDocs build in the documentation repository after changing its pages.
+
+## Validation and hardware state
+
+- Select checks for the changed behavior. Use test mode for experimental scripts and the automation dry run for protocols; syntax checks alone do not validate pulse arguments or timing constraints.
+- Run the GUI/engine equivalence harness when the mirror rule above applies. Report unavailable hardware or harnesses accurately; do not report an unrun check as passed.
+- Preserve FPGA ownership and reboot-recovery checks. Test mode must not reserve the board. Only the owner may release it; do not manually clear busy status to bypass recovery after a crash or uncertain initialization/cleanup.
+- Keep runtime `libs/status`, parameter files, acquisition outputs, and machine-specific settings out of source commits.
+- Review the final diff for unrelated changes and report the relevant validation briefly.
