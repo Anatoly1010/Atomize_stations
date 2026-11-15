@@ -23,9 +23,9 @@ stays.
 
 Watch out until Phase 4 and Phase 5:
 
-- The ITC and Cryomech PCs: once they pull the synced `ITC_FC.py`, the field controller reads
-  `Calibration_curve_08_2024_Sibir_magnet.csv` from `~/.config/<app name>/device_config/`. Check it is
-  there; if not, copy it from the repo's `atomize/device_modules/config/`.
+- The Sibir calibration curve is optional. `ITC_FC.py` opens it only for
+  `magnet_field(field, calibration = 'True')`, which no tool or script uses today, and then reads it
+  from `~/.config/<app name>/device_config/`; a setup without the file gets a clear error.
 - `sync_check.py --sync-cc` still mirrors the shared control-center tools from `Atomize_ITC`, while
   the laptop runs `Atomize_stations/itc`. Edits to those tools must go into `Atomize_ITC` too until
   Phase 5 moves the lead to the station.
@@ -202,8 +202,9 @@ are not installed and are not needed on the box. Needs about half a day with no 
 - [ ] `git clone` plain Atomize to `~/sources/Atomize`, then `pip install -e ~/sources/Atomize`.
 - [ ] `git clone` the station repo to `~/sources/Atomize_stations`, then `pip install -e ~/sources/Atomize_stations/itc`.
 - [ ] Copy the I/Q tables (`iq_cal_*`, `rx_cal_*`) into the user copy of `PB_Insys_DAC_config.ini`.
-- [ ] Check that `Calibration_curve_08_2024_Sibir_magnet.csv` is in `~/.config/atomize-itc/device_config/`;
-      if not, copy it there from `~/sources/Atomize_ITC/atomize/device_modules/config/`.
+- [ ] Only if scripts use `calibration = 'True'`: check that `Calibration_curve_08_2024_Sibir_magnet.csv`
+      is in `~/.config/atomize-itc/device_config/`; if not, copy it there from
+      `~/sources/Atomize_ITC/atomize/device_modules/config/`.
 - [ ] Put the local files back: `rsync -a ~/itc_local_backup/ ~/sources/Atomize_stations/itc/`
 - [ ] Desktop launcher and icons: `python3 ~/sources/Atomize_stations/itc/icons/install_desktop.py`
 - [ ] `gui_vs_engine.py` (if on the box): point it at the new presets folder if the old path is written in it.
