@@ -5,17 +5,33 @@ Created 2026-11-15. Status: Phases 1 to 3 done; Phase 4 (spectrometer PC) is nex
 
 ## Resume here
 
-State on 2026-11-15, end of session 2. Phases 1 and 2 are committed and pushed; Phase 3 is done and
-committed in `Atomize_stations` (not pushed).
+State on 2026-11-15, end of session 2. Phases 1 to 3 are done, committed and pushed in every repo.
 
 | Repo | State |
 |---|---|
 | `Atomize` | `12dad09`: `python -m atomize` starts an installed station's window; `ITC_FC.py` reads the Sibir curve from the user config copy; `test_preset_loader.py` moved to the ITC station |
-| `Atomize_stations` | `4b30edf`: `README.md` and `itc/`, built from `Atomize_ITC` `070540e`; remote `origin` = `https://github.com/Anatoly1010/Atomize_stations.git`, branch `main` |
-| `Atomize_ITC`, the forks, `atomize_sync` | unchanged since their pushed commits; `Atomize_ITC` stays in use until Phase 4 |
+| `Atomize_stations` | `README.md` and `itc/`, built from `Atomize_ITC` `070540e`; `c0ee999` put back the whole `icons/` folder; remote `origin` = `https://github.com/Anatoly1010/Atomize_stations.git`, branch `main` |
+| `Atomize_ITC`, `Atomize_NIOCH`, `Atomize_Cryomech` | plain's `ITC_FC.py` synced in (session 2, last step); `Atomize_ITC` stays in use on the spectrometer PC until Phase 4, and its `docs/stations/ROADMAP.md` now only points here |
+| `Atomize_NIOCH_Q` | keeps its older `ITC_FC.py` (Q-band magnet firmware, no calibration curve), as `sync_check.py` allows |
+| `atomize_sync` | `test_preset_loader.py` is per-fork: it parses each fork's own presets |
+
+The development laptop runs the new setup: `~/.venvs/atomize` holds the core 0.5.0, and
+`~/.venvs/atomize-itc` holds the core plus `Atomize_stations/itc` (both editable). `apull` and
+`apush` include `Atomize_stations`; `apull` reinstalls the core into both venvs and the station into
+`atomize-itc` when a `pyproject.toml` changes. The old `Atomize_ITC` install is removed; the checkout
+stays.
+
+Watch out until Phase 4 and Phase 5:
+
+- The ITC and Cryomech PCs: once they pull the synced `ITC_FC.py`, the field controller reads
+  `Calibration_curve_08_2024_Sibir_magnet.csv` from `~/.config/<app name>/device_config/`. Check it is
+  there; if not, copy it from the repo's `atomize/device_modules/config/`.
+- `sync_check.py --sync-cc` still mirrors the shared control-center tools from `Atomize_ITC`, while
+  the laptop runs `Atomize_stations/itc`. Edits to those tools must go into `Atomize_ITC` too until
+  Phase 5 moves the lead to the station.
 
 How `itc/` was built: every `Atomize_ITC` file that plain does not have or that differs from
-plain's, plus `tests/conftest.py` and `license.md`, minus `__main__.py`, `pyproject.toml`,
+plain's, plus `tests/conftest.py`, `license.md` and the whole `icons/` folder, minus `__main__.py`, `pyproject.toml`,
 `last_dir.py` (plain's is used), `ITC_FC.py` and the moved preset test. No `atomize/__init__.py`
 and no `device_modules/__init__.py`, so the folders join the core's. Changed against `Atomize_ITC`:
 `main.py` passes `lconf.ROOT_DIR/libs` to the core window; `epr_auto/params.py` finds the presets
@@ -49,8 +65,7 @@ above must stay).
 
 Next, in order:
 
-1. Push `Atomize_stations` (the user does this).
-2. Phase 4 on the spectrometer PC, following the install guide (`~/claude/atomize-itc-install.md`
+1. Phase 4 on the spectrometer PC, following the install guide (`~/claude/atomize-itc-install.md`
    on the development machine).
 
 Decisions made: station repo `Atomize_stations`, fresh history, branch `main`; `atomize-itc`
