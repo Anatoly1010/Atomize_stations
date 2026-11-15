@@ -1,17 +1,17 @@
 # Two repos instead of five — roadmap
 
-Created 2026-11-15. Status: Phases 1 and 2 done; Phase 3 partly done. This file moved here from
+Created 2026-11-15. Status: Phases 1 to 3 done; Phase 4 (spectrometer PC) is next. This file moved here from
 `Atomize_ITC/docs/stations/`.
 
 ## Resume here
 
-State on 2026-11-15, end of session 2. Phase 1 is committed, pushed and synced into every fork.
-Phase 2 is built and committed locally; `Atomize_stations` is not pushed yet.
+State on 2026-11-15, end of session 2. Phases 1 and 2 are committed and pushed; Phase 3 is done and
+committed in `Atomize_stations` (not pushed).
 
 | Repo | State |
 |---|---|
-| `Atomize` | `12dad09` (not pushed): `python -m atomize` starts an installed station's window; `ITC_FC.py` reads the Sibir curve from the user config copy; `test_preset_loader.py` moved to the ITC station |
-| `Atomize_stations` | first commit (not pushed): `README.md` and `itc/`, built from `Atomize_ITC` `070540e`; remote `origin` = `https://github.com/Anatoly1010/Atomize_stations.git`, branch `main` |
+| `Atomize` | `12dad09`: `python -m atomize` starts an installed station's window; `ITC_FC.py` reads the Sibir curve from the user config copy; `test_preset_loader.py` moved to the ITC station |
+| `Atomize_stations` | `4b30edf`: `README.md` and `itc/`, built from `Atomize_ITC` `070540e`; remote `origin` = `https://github.com/Anatoly1010/Atomize_stations.git`, branch `main` |
 | `Atomize_ITC`, the forks, `atomize_sync` | unchanged since their pushed commits; `Atomize_ITC` stays in use until Phase 4 |
 
 How `itc/` was built: every `Atomize_ITC` file that plain does not have or that differs from
@@ -34,15 +34,23 @@ stay unchanged; the main window opens with the EPR Endstation Control tab and `i
 folder; plain `pytest` 197 passed. File check: core + `itc/` = `Atomize_ITC` apart from exactly the
 changes listed above.
 
+Phase 3 (scratch copies of the core, the station and today's `Atomize_ITC`, each with an empty
+temporary home folder, so no real config was touched): a first start copies `config.ini` and 64
+device configs (53 core + 11 ITC) identical to what `Atomize_ITC` copies; all 14 control-center tools
+the endstation tab starts open without errors, as in `Atomize_ITC` (the 4 `*_preset_insys.py` that
+`main.py` still names are `###unused` and missing in both); one script per experiment type passes in
+test mode from `libs/`, as the main window starts them (DEER, 3P-ESEEM, nutation, T2, CPMG, THz), same
+as `Atomize_ITC`; station `pytest tests` 200 passed with and without a user config, after
+`test_tr_two_fields.py` got its own temporary user config. The station's `config.ini` still has
+`script_dir = /home/fel2/sources/Atomize_ITC/atomize/tests`, a folder that does not exist today either.
+
 If `Atomize_ITC` changes before Phase 4, copy those files into `itc/` by hand (the changed spots
 above must stay).
 
 Next, in order:
 
-1. Push `Atomize` and `Atomize_stations` (the user does this).
-2. Finish Phase 3: open every control-center tool, one script per experiment type in test mode, and a
-   fresh start with no user configs.
-3. Phase 4 on the spectrometer PC, following the install guide (`~/claude/atomize-itc-install.md`
+1. Push `Atomize_stations` (the user does this).
+2. Phase 4 on the spectrometer PC, following the install guide (`~/claude/atomize-itc-install.md`
    on the development machine).
 
 Decisions made: station repo `Atomize_stations`, fresh history, branch `main`; `atomize-itc`
@@ -141,10 +149,10 @@ in `tests/test_liveplot_runs.py`.
 - [x] File check: core + `itc/` together give the same files as today's `Atomize_ITC`, apart from a
       short expected list.
 - [x] `pytest` passes.
-- [ ] `atomize-itc` opens with the endstation tab; every control-center tool opens.
-- [ ] One script per experiment type passes in test mode.
+- [x] `atomize-itc` opens with the endstation tab; every control-center tool opens.
+- [x] One script per experiment type passes in test mode.
 - [x] `epr-auto run protocols/tune_up.yaml --test` passes.
-- [ ] A fresh start with no user configs copies the right ITC values.
+- [x] A fresh start with no user configs copies the right ITC values.
 
 ## Phase 4 — Spectrometer PC
 

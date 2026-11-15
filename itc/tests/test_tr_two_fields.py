@@ -3,6 +3,7 @@
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
+import configparser
 import importlib
 import sys
 
@@ -12,6 +13,25 @@ import pytest
 from atomize.control_center.tr_control import Worker
 from atomize.control_center.tr_two_fields import acquire, field_axis
 from atomize.general_modules.csv_opener_saver import Saver_Opener
+import atomize.device_modules.config.config_utils as cutil
+import atomize.main.local_config as lconf
+
+PACKAGE = Path(__file__).resolve().parents[1] / 'atomize'
+
+
+@pytest.fixture(autouse=True)
+def user_config(monkeypatch, tmp_path):
+    config = configparser.ConfigParser()
+    config.read(PACKAGE / 'config.ini')
+    config['DEFAULT']['open_dir'] = config['DEFAULT']['script_dir'] = str(tmp_path)
+    path = tmp_path / 'main_config.ini'
+    with open(path, 'w') as stream:
+        config.write(stream)
+    devices = tmp_path / 'device_config'
+    shutil.copytree(Path(cutil.__file__).parent, devices)
+    shutil.copytree(PACKAGE / 'device_modules' / 'config', devices, dirs_exist_ok=True)
+    monkeypatch.setattr(lconf, 'load_config', lambda: (str(path), str(devices)))
+    monkeypatch.setattr(lconf, 'load_config_device', lambda: str(devices))
 
 
 class Magnet:
@@ -245,18 +265,12 @@ def test_save_all_channels_and_completed_scan_snapshots(tmp_path, fmt):
 @pytest.mark.parametrize('num_osc,reverse', [(1, False), (2, False), (3, True)])
 def test_native_preflight_checks_both_ranges_without_io(monkeypatch, tmp_path, num_osc, reverse):
     import atomize.general_modules.general_functions as general
-    import atomize.main.local_config as config
     import atomize.control_center.field_param as field_param
     import pyvisa
 
     monkeypatch.setattr(sys, 'argv', ['test'])
     monkeypatch.setattr(field_param, 'path', lambda: str(tmp_path / 'missing-field.param'))
     monkeypatch.setattr(general, 'test_flag', general.test_flag)
-    import atomize.device_modules.config.config_utils as cutil
-    devices = tmp_path / 'device_config'
-    shutil.copytree(Path(cutil.__file__).parent, devices)
-    shutil.copytree(Path(__file__).parents[1] / 'atomize/device_modules/config', devices, dirs_exist_ok=True)
-    monkeypatch.setattr(config, 'load_config_device', lambda: str(devices))
 
     def forbidden(*args, **kwargs):
         raise AssertionError('Native preflight must not use simulated instruments, VISA, files or LivePlot.')
