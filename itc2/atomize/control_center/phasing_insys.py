@@ -1,0 +1,4286 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import re
+import sys
+from atomize.general_modules.gui_style import REFINED_STYLES, style_file_dialog
+from atomize.control_center.phasing_messages import PhasingMessagePanel
+import math
+import time
+import json
+import tempfile
+import traceback
+import numpy as np
+from multiprocessing import Process, Pipe
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QLabel, QDoubleSpinBox, QSpinBox, QComboBox, QPushButton, QTextEdit, QGridLayout, QFrame, QCheckBox, QFileDialog, QVBoxLayout, QTabWidget, QScrollArea, QHBoxLayout, QPlainTextEdit, QProgressBar,  QTreeView, QHeaderView, QSizeGrip, QLineEdit, QFileIconProvider
+from PyQt6.QtGui import QIcon, QColor, QAction, QTextCursor
+from PyQt6.QtCore import Qt, QTimer
+import atomize.general_modules.general_functions as general
+import atomize.general_modules.csv_opener_saver as openfile
+import atomize.general_modules.last_dir as ldir
+import atomize.control_center.field_param as field_param
+import atomize.control_center.temp_param as temp_param
+from atomize.control_center.time_log_spinbox import TimeLogSpinBox
+from atomize.general_modules.gui_style import CHECKBOX_STYLE
+# Shared with the AWG tool (its docstring has the rationale): both Insys
+# phasing GUIs map the integration window ns -> points against a
+# time_per_point of 0.4 * decimation, which has no exact binary form.
+from atomize.control_center.awg_phasing_insys import points_from_ns
+
+# Reload-signal file written by the Sequence Calculator (sequence_calculator.py).
+# While this window is open we poll it and reload the named preset when the
+# nonce changes for our channel, so "Open in RECT" updates the window in place.
+SEQCALC_SIGNAL = os.path.join(tempfile.gettempdir(), 'atomize_seqcalc.param')
+SEQCALC_CHANNEL = 'rect'
+
+class MainWindow(QMainWindow):
+    """
+    A main window class
+    """
+    def __init__(self, *args, **kwargs):
+        """
+        A function for connecting actions and creating a main window
+        """
+        super(MainWindow, self).__init__(*args, **kwargs)
+        self.menu()
+        #####
+        try:
+            path_to_main2 = os.path.join(os.path.abspath(os.getcwd()), '..', 'libs')
+            os.chdir(path_to_main2) 
+        except FileNotFoundError:
+            path_to_main2 = os.path.join(os.path.abspath(os.getcwd()), '..', '..', 'libs')
+            os.chdir(path_to_main2)
+        #####
+        
+        # Phase correction
+        self.deg_rad = 180 / np.pi #57.2957795131
+        self.first_order_coef = 180 / np.pi * 1e-9
+        self.sec_order_coef = 180 / np.pi * 1e-18
+
+        # ---- Link mode state ----
+        # link_param selects which pulse parameter is coupled ('Off' when
+        # disabled); link_factor maps pulse index -> weight (0 = No). Editing a
+        # linked pulse's active parameter by delta shifts every other linked
+        # pulse proportionally (unit = delta / factor_edited; pulse_j += unit *
+        # factor_j). Initialised before design_tab_1(), because the pulse
+        # spin-boxes connect link_source_changed during that build. Defaulting
+        # link_param to 'Off' keeps build-time value snaps inert.
+        self.link_param = 'Off'
+        self.link_factor = {i: 0.0 for i in range(1, 10)}
+        self._linking = False
+        self._link_prev = {}
+
+        self.design_tab_1()
+        self.design_tab_2()
+        self.design_tab_3()
+        self.design_tab_4()
+        self.design_tab_5()
+
+        self.laser_q_switch_delay = 0 #160000 # in ns
+
+        """
+        Create a process to interact with an experimental script that will run on a different thread.
+        We need a different thread here, since PyQt GUI applications have a main thread of execution that runs the event loop and GUI. If you launch a long-running task in this thread, then your GUI will freeze until the task terminates. During that time, the user won’t be able to interact with the application
+        """
+
+        self.is_experiment = False
+        self.exit_clicked = 0
+        self.stop_requested = False
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.check_messages)
+        self.monitor_timer = QTimer()
+        self.monitor_timer.timeout.connect(self.check_process_status)
+        self.file_handler = openfile.Saver_Opener()
+
+        # ---- Live Edit (no-restart re-arm) ----
+        # When enabled, edits to a running preview's pulse Start / Length are
+        # pushed to the worker over the existing pipe and applied with a live
+        # pulser_update() -- no card teardown. Debounced so a burst of edits
+        # coalesces into one re-arm. live_sig captures the structure the running
+        # worker was opened with (active-pulse count, phase-cycle length,
+        # decimation); an edit that changes it falls back to a full restart.
+        self.live_edit_on = 0
+        self.live_sig = None
+        self.live_timer = QTimer()
+        self.live_timer.setSingleShot(True)
+        self.live_timer.timeout.connect(self.live_apply)
+
+        # Watch for "Open in RECT" requests from the Sequence Calculator and
+        # reload the preset into this already-open window. Seed the seen-nonce
+        # from the current signal file so a stale request (or the one we were
+        # just launched with via argv) does not fire a spurious reload.
+        self._seqcalc_nonce = self._read_seqcalc_nonce()
+        self.seqcalc_timer = QTimer()
+        self.seqcalc_timer.timeout.connect(self.check_seqcalc_reload)
+        self.seqcalc_timer.start(400)
+        QTimer.singleShot(0, lambda: self.resize(self.width(), self.sizeHint().height()))
+
+    def _read_seqcalc_nonce(self):
+        try:
+            with open(SEQCALC_SIGNAL) as f:
+                parts = f.read().split('\n')
+            return parts[2].strip() if len(parts) >= 3 else ''
+        except OSError:
+            return ''
+
+    def check_seqcalc_reload(self):
+        """Poll the Sequence Calculator signal file; reload on a new request."""
+        try:
+            with open(SEQCALC_SIGNAL) as f:
+                parts = f.read().split('\n')
+        except OSError:
+            return
+        if len(parts) < 3:
+            return
+        channel, path, nonce = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        if not nonce or nonce == self._seqcalc_nonce:
+            return
+        self._seqcalc_nonce = nonce
+        if channel == SEQCALC_CHANNEL and os.path.isfile(path):
+            # This window is already open and likely tuned (field, rep rate,
+            # window, decimation, scans, sweep...). Apply ONLY the pulse layout
+            # from the calculator; never touch those parameters.
+            self.apply_seqcalc_pulses(path)
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.turn_off()
+
+    def menu(self):
+        menubar = self.menuBar()
+        menubar.setStyleSheet(REFINED_STYLES['MENU_STYLE'])
+        file_menu = menubar.addMenu("File")
+        pulse_menu = menubar.addMenu("Pulse")
+        self.exp_menu = menubar.addMenu("Experiment")
+
+        menubar.setFixedHeight(27)
+
+        self.action_read = QAction("Read from file", self)
+        self.action_read.triggered.connect( self.open_file_dialog )
+        file_menu.addAction(self.action_read)
+
+        self.action_save = QAction("Save to file", self)
+        self.action_save.triggered.connect(self.save_file_dialog)
+        file_menu.addAction(self.action_save)
+
+        self.reset_all = QAction("Reset All", self)
+        self.reset_all.triggered.connect(self.reset_all_func)
+        pulse_menu.addAction(self.reset_all)
+
+        pulse_menu.addSeparator()
+
+        reset_pulse_menu = pulse_menu.addMenu("Reset Pulse...")
+
+        self.pulse_actions = []
+
+        for i in range(1, 10):
+            action_text = f"P{i}"
+            action = QAction(action_text, self)
+            
+            action.triggered.connect(lambda checked, p=i: self.reset_pulse_func(p))
+            
+            reset_pulse_menu.addAction(action)
+            self.pulse_actions.append(action)
+
+        pulse_menu.addSeparator()
+
+        copy_pulse_menu = pulse_menu.addMenu("Copy Pulse...")
+
+        self.copy_pulse_actions = []
+
+        for i in range(1, 10):
+            action_text = f"P{i}"
+            action = QAction(action_text, self)
+            
+            action.triggered.connect(lambda checked, p=i: self.copy_pulse_func(p))
+            
+            copy_pulse_menu.addAction(action)
+            self.copy_pulse_actions.append(action)
+
+        cut_pulse_menu = pulse_menu.addMenu("Cut Pulse...")
+
+        self.cut_pulse_actions = []
+
+        for i in range(1, 10):
+            action_text = f"P{i}"
+            action = QAction(action_text, self)
+            
+            action.triggered.connect(lambda checked, p=i: self.cut_pulse_func(p))
+            
+            cut_pulse_menu.addAction(action)
+            self.cut_pulse_actions.append(action)
+
+        paste_pulse_menu = pulse_menu.addMenu("Paste Pulse...")
+
+        self.paste_pulse_actions = []
+
+        for i in range(1, 10):
+            action_text = f"P{i}"
+            action = QAction(action_text, self)
+            
+            action.triggered.connect(lambda checked, p=i: self.paste_pulse_func(p))
+            
+            paste_pulse_menu.addAction(action)
+            self.paste_pulse_actions.append(action)
+        
+        self.menu_exp()
+
+    def menu_exp(self):
+        cwd = os.getcwd()
+
+        if os.path.basename(cwd) == 'libs':
+            cwd = os.path.abspath(os.path.join(cwd, '..', 'atomize', 'control_center'))
+
+        t2_sequences = {
+            'Hahn Echo; 2S': 'hahn_echo_2s.phase',
+            'Hahn Echo; 4S': 'hahn_echo_4s.phase'
+        }
+
+        t2_exp_menu = self.exp_menu.addMenu('T₂')
+        
+        for label, file_name in t2_sequences.items():
+            full_path = os.path.join(cwd, 'experiments', file_name)
+            action = QAction(label, self)
+            action.triggered.connect(lambda checked, name=full_path: self.set_preset_exp(name))
+            t2_exp_menu.addAction(action)
+
+        t1_exp_menu = self.exp_menu.addMenu('T₁')
+
+        t1_sequences = {
+            'Invertion Recovery Echo; 4S; Log': 'inversion_recovery_echo_4s_log.phase'
+        }
+
+        for label, file_name in t1_sequences.items():
+            full_path = os.path.join(cwd, 'experiments', file_name)
+            action = QAction(label, self)
+            action.triggered.connect(lambda checked, name=full_path: self.set_preset_exp(name))
+            t1_exp_menu.addAction(action)
+
+        nutation_exp_menu = self.exp_menu.addMenu('Nutation')
+
+        nutation_sequences = {
+            'Rabi Nutation Echo; 4S': 'rabi_echo_4s.phase'
+        }
+
+        for label, file_name in nutation_sequences.items():
+            full_path = os.path.join(cwd, 'experiments', file_name)
+            action = QAction(label, self)
+            action.triggered.connect(lambda checked, name=full_path: self.set_preset_exp(name))
+            nutation_exp_menu.addAction(action)
+
+        ed_exp_menu = self.exp_menu.addMenu('Echo-Detected')
+
+        ed_sequences = {
+            'Echo-Detected; 2S': 'ed_2s.phase',
+            'Echo-Detected; 4S': 'ed_4s.phase'
+        }
+
+        for label, file_name in ed_sequences.items():
+            full_path = os.path.join(cwd, 'experiments', file_name)
+            action = QAction(label, self)
+            action.triggered.connect(lambda checked, name=full_path: self.set_preset_exp(name))
+            ed_exp_menu.addAction(action)
+
+        eseem_exp_menu = self.exp_menu.addMenu('ESEEM')
+
+        eseem_sequences = {
+            '3pESEEM; 4S': '3peseem_4s.phase',
+            'HYSCORE; 16S': 'hyscore_16s.phase',
+        }
+
+        for label, file_name in eseem_sequences.items():
+            full_path = os.path.join(cwd, 'experiments', file_name)
+            action = QAction(label, self)
+            action.triggered.connect(lambda checked, name=full_path: self.set_preset_exp(name))
+            eseem_exp_menu.addAction(action)
+
+        pds_exp_menu = self.exp_menu.addMenu('PDS')
+
+        pds_sequences = {
+            'SIFTER; 16S': 'sifter_16s.phase',
+        }
+
+        for label, file_name in pds_sequences.items():
+            full_path = os.path.join(cwd, 'experiments', file_name)
+            action = QAction(label, self)
+            action.triggered.connect(lambda checked, name=full_path: self.set_preset_exp(name))
+            pds_exp_menu.addAction(action)
+
+    def set_preset_exp(self, filename):
+        self.open_file(filename)
+
+    def cut_pulse_func(self, pulse_number):
+        self.copy_pulse_func(pulse_number)
+
+        if pulse_number == 1:
+            values = [576, 816, 0, 0, "+x,-x", "DETECTION"]
+        else:
+            values = [0, 0, 0, 0, "+x,+x", "MW"]
+
+        suffixes = ["_st", "_len", "_st_inc", "_len_inc"]
+        
+        for i, suffix in enumerate(suffixes):
+            getattr(self, f"P{pulse_number}{suffix}").setValue(values[i])
+
+        phase_widget = getattr(self, f"Phase_{pulse_number}")
+        new_phase_text = str(values[4])
+        phase_widget.setPlainText(new_phase_text)
+            
+        combo_widget = getattr(self, f"P{pulse_number}_type")
+        new_combo_text = str(values[5])
+        combo_widget.setCurrentText(new_combo_text)
+
+    def paste_pulse_func(self, pulse_number):
+        if self.pulse_buffer is None:
+            return
+
+        getattr(self, f"P{pulse_number}_st").setValue(self.pulse_buffer['st'])
+        getattr(self, f"P{pulse_number}_len").setValue(self.pulse_buffer['len'])
+        getattr(self, f"P{pulse_number}_st_inc").setValue(self.pulse_buffer['st_inc'])
+        getattr(self, f"P{pulse_number}_len_inc").setValue(self.pulse_buffer['len_inc'])
+        getattr(self, f"Phase_{pulse_number}").setPlainText(self.pulse_buffer['phase'])
+        getattr(self, f"P{pulse_number}_type").setCurrentText(self.pulse_buffer['type'])
+    
+    def copy_pulse_func(self, pulse_number):
+        self.pulse_buffer = {
+            'st': getattr(self, f"P{pulse_number}_st").value(),
+            'len': getattr(self, f"P{pulse_number}_len").value(),
+            'st_inc': getattr(self, f"P{pulse_number}_st_inc").value(),
+            'len_inc': getattr(self, f"P{pulse_number}_len_inc").value(),
+            'phase': getattr(self, f"Phase_{pulse_number}").toPlainText(),
+            'type': getattr(self, f"P{pulse_number}_type").currentText()
+        }
+
+    def reset_pulse_func(self, pulse_number):
+        if pulse_number == 1:
+            values = [576, 816, 0, 0, "+x,-x", "DETECTION"]
+        elif pulse_number == 2:
+            values = [0, 22.4, 0, 0, "+x,-x", "MW"]
+        elif pulse_number == 3:
+            values = [288, 44.8, 0, 0, "+x,+x", "MW"]
+        else:
+            values = [0, 0, 0, 0, "+x,+x", "MW"]
+
+        suffixes = ["_st", "_len", "_st_inc", "_len_inc"]
+        
+        for i, suffix in enumerate(suffixes):
+            getattr(self, f"P{pulse_number}{suffix}").setValue(values[i])
+
+        phase_widget = getattr(self, f"Phase_{pulse_number}")
+        new_phase_text = str(values[4])
+        phase_widget.setPlainText(new_phase_text)
+            
+        combo_widget = getattr(self, f"P{pulse_number}_type")
+        new_combo_text = str(values[5])
+        combo_widget.setCurrentText(new_combo_text)
+
+    def reset_all_func(self):
+        for i in range(1, 10):
+            self.reset_pulse_func(i)
+
+    def design_tab_1(self):
+        self.setObjectName("MainWindow")
+        self.setWindowTitle("RECT Channel Pulse Control")
+        self.setStyleSheet(REFINED_STYLES['WINDOW_STYLE'])
+
+        path_to_main = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(path_to_main, 'gui/icon_rect.ico')
+        self.setWindowIcon( QIcon(icon_path) )
+        self.path = os.path.join(path_to_main, '..', '..', '..', '..', 'experimental_data')
+
+        self.setMinimumWidth(1720)
+        self.setMaximumWidth(2660)
+
+        central_container = QWidget()
+        self.setCentralWidget(central_container)
+        main_window_layout = QVBoxLayout(central_container)
+        main_window_layout.setContentsMargins(0, 0, 0, 0)
+        main_window_layout.setSpacing(0)
+
+        self.tab_pulse = QTabWidget()
+        main_window_layout.addWidget(self.tab_pulse)
+
+        self.tab_pulse.setTabShape(QTabWidget.TabShape.Rounded)
+        self.tab_pulse.setStyleSheet(REFINED_STYLES['TAB_STYLE'])
+
+        pulse_page = QWidget()
+        pulse_page_layout = QVBoxLayout(pulse_page)
+        pulse_page_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.horizontalScrollBar().setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+
+        scroll.setStyleSheet(REFINED_STYLES['SCROLL_STYLE'])
+
+        container = QWidget()
+        scroll.setWidget(container)
+        tab_layout = QVBoxLayout(container)
+        pulse_margins = tab_layout.contentsMargins()
+        pulse_margins.setBottom(12)
+        tab_layout.setContentsMargins(pulse_margins)
+        
+        self.gridLayout = QGridLayout()
+        self.gridLayout.setContentsMargins(5, 5, 0, 0)
+        self.gridLayout.setVerticalSpacing(4)
+        self.gridLayout.setHorizontalSpacing(20)
+
+
+        tab_layout.addLayout(self.gridLayout)
+
+        pulse_page_layout.addWidget(scroll)
+        self.tab_pulse.addTab(pulse_page, "Pulses")
+        self.tab_pulse.tabBar().setTabTextColor(0, QColor(193, 202, 227))
+
+        buttons_widget = QWidget()
+        self.buttons_layout = QGridLayout(buttons_widget)
+        self.buttons_layout.setContentsMargins(15, 10, 10, 10)
+        self.buttons_layout.setVerticalSpacing(6)
+        self.buttons_layout.setHorizontalSpacing(20)
+        
+        main_window_layout.addWidget(buttons_widget)
+
+        # ---- Labels & Inputs ----
+        labels = [("Start", "label_1"), ("Length", "label_2"), ("Start Increment", "label_3"), ("Length Increment", "label_4"), ("Type", "label_5"), ("Phase", "label_6"), ("Repetition Rate", "label_7"), ("Magnetic Field", "label_8"), ("Progress", "label_p1")]
+
+        for name, attr_name in labels:
+            lbl = QLabel(name)
+            lbl.setFixedSize(170, 26)
+            setattr(self, attr_name, lbl)
+            lbl.setStyleSheet(REFINED_STYLES['LABEL_STYLE'])
+
+
+        # ---- Boxes ----
+        pulses = [(QDoubleSpinBox, 0, 100e6, 0, 3.2, 1, " ns", "_st", "_start"),
+                  (QDoubleSpinBox, 0, 1900, 0, 3.2, 1, " ns", "_len", "_length"),
+                  (QDoubleSpinBox, 0, 1e6, 0, 3.2, 1, " ns", "_st_inc", "_st_increment"),
+                  (QDoubleSpinBox, 0, 320, 0, 3.2, 1, " ns", "_len_inc", "_len_increment")
+                 ]
+
+        for j in range(1, 5):
+            pulse_set = pulses[j-1]
+            label_widget = getattr(self, f"label_{j}")
+            self.gridLayout.addWidget(label_widget, j + 2, 0)
+
+            for i in range(1, 10):
+                spin_box = (pulse_set[0])()
+                spin_box.setRange(pulse_set[1], pulse_set[2])
+                spin_box.setStyleSheet(REFINED_STYLES['COMPACT_FIELD_STYLE'])
+                spin_box.setSingleStep(pulse_set[4])
+                if (i == 1) and (j == 1):
+                    spin_box.setValue(576)
+                elif (i == 1) and (j == 2):
+                    spin_box.setRange(0, 6.4e3)
+                    spin_box.setValue(816)
+                elif (i == 2) and (j == 2):
+                    spin_box.setValue(22.4)
+                elif (i == 3) and (j == 1):
+                    spin_box.setValue(288)
+                elif (i == 3) and (j == 2):
+                    spin_box.setValue(44.8)
+                else:  
+                    spin_box.setValue(pulse_set[3])
+                spin_box.setDecimals(pulse_set[5])
+                spin_box.setSuffix(pulse_set[6])
+                spin_box.setFixedSize(170, 26)
+                spin_box.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.PlusMinus)
+                spin_box.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+
+                spin_box.setKeyboardTracking( False )
+                # widget name pulse_set[7]
+                setattr(self, f"P{i}{pulse_set[7]}", spin_box)
+                # parameter name pulse_set[8]
+                spin_box.valueChanged.connect(
+                        lambda val, idx = i, s7 = pulse_set[7], s8 = pulse_set[8]:
+                        self.update_pulse_param(idx, s7, s8)
+                        )
+                # Start / Length are linkable (Position / Length).
+                if pulse_set[7] in ('_st', '_len'):
+                    spin_box.valueChanged.connect(
+                        lambda val, idx = i, s7 = pulse_set[7]: self.link_source_changed(idx, s7)
+                    )
+
+                start_value = self.round_and_change(spin_box)
+                setattr(self, f"p{i}{pulse_set[8]}", start_value)
+                self.gridLayout.addWidget(spin_box, j + 2, i)
+
+                if j == 1:
+                    lbl = QLabel(f"{i}")
+                    lbl.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+                    lbl.setStyleSheet(REFINED_STYLES['LABEL_STYLE'])
+                    self.gridLayout.addWidget(lbl, 0, i)
+
+        # ---- Separators ----
+        def hline():
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setFrameShadow(QFrame.Shadow.Sunken)
+            line.setLineWidth(2)
+            return line
+
+        self.gridLayout.addWidget(hline(), 1, 0, 1, 10)
+        self.gridLayout.addWidget(hline(), 7, 0, 1, 10)
+
+        # ---- Combo boxes----
+        combo_boxes = [("DETECTION", "_type", "_type", "_typ", ["DETECTION"]),
+                       ("MW", "_type", "_type", "_typ", ["LASER", "MW"]),
+                       ("MW", "_type", "_type", "_typ", ["MW"])
+                      ]
+
+        label_widget = getattr(self, f"label_5")
+        label_widget.setFixedSize(170, 26)
+        self.gridLayout.addWidget(label_widget, 8, 0)
+
+        self.laser_flag = 0
+        self.mw_len_max = pulses[1][2]
+        self.laser_len_max = 15001.6
+
+        for i in range(1, 10):
+            combo = QComboBox()
+            combo.setStyleSheet(REFINED_STYLES['COMBO_STYLE'])
+            combo.setFixedSize(170, 26)
+            if i == 1:
+                combo.addItems(combo_boxes[i-1][4])
+                combo.setCurrentText(combo_boxes[i][0])
+            elif i in (2, 3):
+                combo.addItems(combo_boxes[1][4])
+                combo.setCurrentText(combo_boxes[1][0])
+            else:
+                combo.addItems(combo_boxes[2][4])
+                combo.setCurrentText(combo_boxes[2][0])
+
+            setattr(self, f"P{i}{combo_boxes[2][1]}", combo)
+
+            combo.currentTextChanged.connect(lambda _, idx = i: self.update_pulse_type(idx))
+            setattr(self, f"p{i}_typ", combo.currentText())
+
+            self.gridLayout.addWidget(combo, 8, i)
+
+        self.gridLayout.addWidget(hline(), 9, 0, 1, 10)
+
+        # ---- Text Edits ----
+        text_edit = ["+x,-x", "+x,-x", "+x,+x"]
+
+        for i in range(1, 10):
+            if i == 1:
+                txt = QTextEdit(text_edit[0])
+            elif i == 2:
+                txt = QTextEdit(text_edit[1])
+            else:
+                txt = QTextEdit(text_edit[2])
+            txt.setFixedSize(170, 60)
+            txt.setAcceptRichText(False)
+            #txt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            txt.setStyleSheet(REFINED_STYLES['COMPACT_TEXT_STYLE'])
+            
+            setattr(self, f"Phase_{i}", txt)
+            txt.textChanged.connect(lambda idx = i: self.update_pulse_phase(idx))
+            self.update_pulse_phase(i)
+
+            self.gridLayout.addWidget(txt, 10, i)
+            txt.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu) 
+
+        label_widget = getattr(self, f"label_6")
+        label_widget.setFixedSize(170, 26)
+        self.gridLayout.addWidget(label_widget, 10, 0)
+        self.gridLayout.addWidget(hline(), 11, 0, 1, 10)
+
+        link_controls = QWidget()
+        link_controls.setFixedSize(360, 26)
+        link_layout = QHBoxLayout(link_controls)
+        link_layout.setContentsMargins(0, 0, 0, 0)
+        link_layout.setSpacing(0)
+        self.Combo_link_pulses = QComboBox()
+        for parameter in ['Off', 'Length', 'Position']:
+            self.Combo_link_pulses.addItem(f"Link: {parameter}", parameter)
+        self.Combo_link_pulses.setFixedSize(140, 26)
+        self.Combo_link_pulses.setStyleSheet(REFINED_STYLES['COMBO_STYLE'])
+        self.Combo_link_pulses.setAccessibleName("Link parameter")
+        self.Combo_link_pulses.setToolTip(
+            "Couple this parameter across pulses. Set a per-pulse weight "
+            "(No / 0.5x / 1x / 2x) in the Link row of the Pulses tab; editing "
+            "the parameter on any linked pulse shifts every other linked pulse "
+            "proportionally to its weight. Off keeps the pulse link factors.")
+        self.Combo_link_pulses.currentIndexChanged.connect(self.link_param_changed)
+        link_layout.addWidget(self.Combo_link_pulses)
+        link_layout.addSpacing(20)
+        self.button_reset_links = QPushButton("×")
+        self.button_reset_links.setFixedSize(26, 26)
+        self._set_glyph_style(self.button_reset_links,
+            REFINED_STYLES['DOCK_CLOSE_STYLE'] + "QPushButton { font-size: 16px; }")
+        self.button_reset_links.setAccessibleName("Reset all links")
+        self.button_reset_links.setToolTip(
+            "Reset all links: set every factor to No and the parameter to Off. Pulse values stay unchanged.")
+        self.button_reset_links.clicked.connect(self.reset_links)
+        link_layout.addWidget(self.button_reset_links)
+        link_layout.addSpacing(4)
+        self.gridLayout.addWidget(link_controls, 12, 0, 1, 2)
+
+        for i in range(1, 10):
+            combo = QComboBox()
+            combo.addItems(["No", "0.5x", "1x", "2x"])
+            combo.setCurrentText("No")
+            combo.setFixedSize(170, 26)
+            combo.setStyleSheet(REFINED_STYLES['COMBO_STYLE'])
+            setattr(self, f"P{i}_lk", combo)
+            combo.currentTextChanged.connect(lambda _, idx = i: self.update_link_factor(idx))
+            if i == 1:
+                link_layout.addWidget(combo)
+            else:
+                self.gridLayout.addWidget(combo, 12, i)
+
+        self.gridLayout.addWidget(hline(), 13, 0, 1, 10)
+
+
+        # ---- Boxes----
+        boxes = [(QDoubleSpinBox, "Rep_rate", "repetition_rate", self.rep_rate, 0.1, 20e3, 500, 1, 1, " Hz"),
+                 (QDoubleSpinBox, "Field", "mag_field", self.field, 10, 15.1e3, 3493, 0.5, 2, " G")]
+        
+        box_c = 0
+        for widget_class, attr_name, par_name, func, v_min, v_max, cur_val, v_step, dec, suf in boxes:
+            rr_box = widget_class()
+            rr_box.setRange(v_min, v_max)
+            rr_box.setStyleSheet(REFINED_STYLES['COMPACT_FIELD_STYLE'])
+            rr_box.setSingleStep(v_step)
+            rr_box.setValue(cur_val)
+            rr_box.setDecimals(dec)
+            rr_box.setSuffix(suf)
+            rr_box.valueChanged.connect(func)
+            rr_box.setFixedSize(170, 26)
+            rr_box.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.PlusMinus)
+            rr_box.setKeyboardTracking( False )
+            setattr(self, attr_name, rr_box)
+            if attr_name == "Rep_rate":
+                setattr(self, par_name, str( rr_box.value() ) + ' Hz')
+            elif attr_name == 'Field':
+                setattr(self, par_name, float( rr_box.value() ))
+
+            self.buttons_layout.addWidget(rr_box, box_c, 1)
+            box_c += 1
+            rr_box.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+
+        rate_controls = QWidget()
+        rate_controls.setFixedSize(360, 26)
+        rate_layout = QHBoxLayout(rate_controls)
+        rate_layout.setContentsMargins(0, 0, 0, 0)
+        rate_layout.setSpacing(0)
+        self.label_7.setFixedSize(124, 26)
+        rate_layout.addWidget(self.label_7)
+        rate_layout.addSpacing(6)
+        self.button_track = QPushButton("T")
+        self.button_track.setFixedSize(26, 26)
+        self.button_track.setEnabled(False)
+        self._set_glyph_style(self.button_track,
+            REFINED_STYLES['DOCK_CLOSE_STYLE'] + "QPushButton { font-size: 15px; }")
+        self.button_track.setAccessibleName("Capture reference curves")
+        self.button_track.setToolTip(
+            "Keep the current I/Q and enabled FFT curves as reference curves; click again to replace them. "
+            "Works in live and accumulation previews; references survive stop/restart.")
+        self.button_track.clicked.connect(self.track_curves)
+        rate_layout.addWidget(self.button_track)
+        rate_layout.addSpacing(4)
+        self.button_track_clear = QPushButton("×")
+        self.button_track_clear.setFixedSize(26, 26)
+        self._set_glyph_style(self.button_track_clear,
+            REFINED_STYLES['DOCK_CLOSE_STYLE'] + "QPushButton { font-size: 16px; }")
+        self.button_track_clear.setAccessibleName("Clear reference curves")
+        self.button_track_clear.setToolTip("Clear the reference curves.")
+        self.button_track_clear.clicked.connect(lambda: self._track_command('clear'))
+        rate_layout.addWidget(self.button_track_clear)
+        rate_layout.addSpacing(4)
+        rate_layout.addWidget(self.Rep_rate)
+        self.buttons_layout.addWidget(rate_controls, 0, 0, 1, 2)
+        label_widget = getattr(self, f"label_8")
+        label_widget.setFixedSize(170, 26)
+        self.buttons_layout.addWidget(label_widget, 1, 0)
+        self.buttons_layout.addWidget(hline(), 2, 0, 1, 12)
+
+
+        #---- Progress Bar ----
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedSize(170, 15)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.progress_bar.setStyleSheet(REFINED_STYLES['PROGRESS_STYLE'])
+
+        # Live Edit controls (Live Mode + Apply Delay) live in the Settings tab.
+        label_widget = getattr(self, f"label_p1")
+        self.buttons_layout.addWidget(label_widget, 0, 2)
+        self.buttons_layout.addWidget(self.progress_bar, 0, 3)
+
+        self._update_rep_time_display()
+
+        # ---- Buttons ----
+        buttons = [("Run Pulses", "button_update", self.update),
+                   ("Stop", "button_stop", self.dig_stop),
+                   ("Exit", "button_off", self.turn_off),
+                   ("Start Experiment", "button_start_exp", self.start_exp)
+                    ]
+
+        #("Stop Experiment", "button_stop_exp", self.stop_exp)
+        
+        btn_c = 3
+        btn_cl = 0
+        for name, attr_name, func in buttons:
+            btn = QPushButton(name)
+            btn.setFixedSize(170, 40)
+            btn.clicked.connect(func)
+            btn.setStyleSheet(REFINED_STYLES['BUTTON_STYLE'])
+            setattr(self, attr_name, btn)
+            if name == "Start Experiment":
+                btn_c = 3
+                btn_cl = 1
+            self.buttons_layout.addWidget(btn, btn_c, btn_cl)
+            btn_c += 1
+        
+        self.message_panel = PhasingMessagePanel()
+        self.errors = self.message_panel.messages
+        self.message_panel.setFixedHeight(
+            self.button_update.height() + self.button_stop.height() + self.button_off.height()
+            + 2 * self.buttons_layout.verticalSpacing())
+        self.buttons_layout.addWidget(self.message_panel, 3, 2, 3, 10)
+        buttons_widget.ensurePolished()
+        buttons_widget.setFixedHeight(self.buttons_layout.sizeHint().height())
+
+        container.ensurePolished()
+        scroll.setFixedHeight(
+            tab_layout.sizeHint().height() + scroll.horizontalScrollBar().sizeHint().height()
+            + 2 * scroll.frameWidth())
+
+        #self.buttons_layout.setColumnStretch(6, 11)
+
+    def design_tab_2(self):
+        dig_setting_page = QWidget()
+        gridLayout = QGridLayout()
+        gridLayout.setContentsMargins(15, 15, 10, 10)
+        gridLayout.setVerticalSpacing(4)
+        gridLayout.setHorizontalSpacing(20)
+
+        dig_setting_page.setLayout(gridLayout)
+
+        self.tab_pulse.addTab(dig_setting_page, "Acquisition")
+        self.tab_pulse.tabBar().setTabTextColor(1, QColor(193, 202, 227))
+
+        # ---- Labels & Inputs ----
+        labels = [("Acquisitions", "label_17"), ("Integration Left", "label_18"), ("Integration Right", "label_19"), ("Decimation", "label_20"), ("Points", "label_e1"), ("Scans", "label_e2"), ("Experiment Name", "label_e3"), ("Curve Name", "label_e4"), ("Start Field", "label_f1"), ("End Field", "label_f2"), ("Field Step", "label_f3"), ("Sweep Type", "label_c1"), ("Start Log Time", "label_e5"), ("End Log Time", "label_e6"),
+            ('X<sub style="font-size: 12pt;">0</sub>', "label_e7"), ("ΔX ", "label_e8"), ("Auto Window", "label_aw")]
+
+        for name, attr_name in labels:
+            lbl = QLabel(name)
+            setattr(self, attr_name, lbl)
+            lbl.setFixedSize(170, 26)
+            lbl.setStyleSheet(REFINED_STYLES['LABEL_STYLE'])
+
+        # ---- Boxes ----
+        double_boxes = [(QSpinBox, "Acq_number", "number_averages", self.acq_number, 1, 1e4, 1, 1, 0, ""),
+                      (QSpinBox, "Dec", "decimation", self.decimat, 1, 4, 1, 1, 0, ""),
+                      (QDoubleSpinBox, "Win_left", "cur_win_left", self.win_left, 0, 6400, 0, 0.4, 1, " ns"),
+                      (QDoubleSpinBox, "Win_right", "cur_win_right", self.win_right, 0, 6400, 320, 0.4, 1, " ns"),
+                      (QDoubleSpinBox, "Win_width", "win_width", self.win_width_func, 0.4, 6400, 100, 0.4, 1, " ns"),
+                      (QSpinBox, "box_points", "cur_points", self.points, 1, 20000, 500, 10, 0, ""),
+                      (QSpinBox, "box_scan", "cur_scan", self.scan, 1, 100, 1, 1, 0, ""),
+                      (QDoubleSpinBox, "box_st_field", "cur_start_field", self.st_field, 0, 15000, 3000, 1, 1, " G"),
+                      (QDoubleSpinBox, "box_end_field", "cur_end_field", self.end_field, 0, 15000, 4000, 1, 1, " G"),
+                      (QDoubleSpinBox, "box_step_field", "cur_step", self.step_field, 0.01, 50, 0.5, 0.1, 2, " G"),
+                      (QDoubleSpinBox, "X0", "cur_x0", self.x0, -100e6, 100e6, 0, 3.2, 1, " ns"),
+                      (QDoubleSpinBox, "XDelta", "cur_xdelta", self.xdelta, -100e6, 100e6, 0, 3.2, 1, " ns")
+                        ]
+
+        for widget_class, attr_name, par_name, func, v_min, v_max, cur_val, v_step, dec, suf in double_boxes:
+            spin_box = widget_class()
+            if isinstance(spin_box, QDoubleSpinBox):
+                spin_box.setRange(v_min, v_max)
+                spin_box.setStyleSheet(REFINED_STYLES['COMPACT_FIELD_STYLE'])
+            else:
+                spin_box.setRange(int(v_min), int(v_max))
+                spin_box.setStyleSheet(REFINED_STYLES['COMPACT_FIELD_STYLE'])
+            spin_box.setSingleStep(v_step)
+            spin_box.setValue(cur_val)
+            if isinstance(spin_box, QDoubleSpinBox):
+                spin_box.setDecimals(dec)
+            spin_box.setSuffix(suf)
+            spin_box.valueChanged.connect(func)
+            spin_box.setFixedSize(170, 26)
+            spin_box.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.PlusMinus)
+
+            spin_box.setKeyboardTracking( False )
+            spin_box.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu) 
+
+            setattr(self, attr_name, spin_box)
+            if isinstance(spin_box, QSpinBox):
+                if attr_name == 'Dec':
+                    setattr(self, par_name, int(spin_box.value()))
+                    self.time_per_point = 0.4 * self.decimation
+                else:
+                    setattr(self, par_name, int(spin_box.value()))
+            else:
+                if attr_name == 'Win_left' or attr_name == 'Win_right':
+                    setattr(self, par_name, points_from_ns( spin_box.value(), self.time_per_point ))
+                else:
+                    setattr(self, par_name, float(spin_box.value()))
+
+        self.X0.setToolTip('X<sub style="font-size: 12pt;">0</sub> value for the custom X-axis.<br>In a Log Time experiment a non-zero X<sub style="font-size: 12pt;">0</sub> sets the X-axis start point; if left at 0 the start is taken from the detection pulse timing (or the first pulse with a non-zero Start Increment).')
+        self.XDelta.setToolTip('ΔX value for the custom X-axis. Applied if not equal to 0.')
+
+        # ---- Log Time spinboxes ----
+        # UI shows plain time + unit (ns/μs/ms/s); self.cur_log_start /
+        # self.cur_log_end stay as log10(time_in_ns) so the worker (exp_log)
+        # and preset files don't change.
+        for attr_name, par_name, func, log_default in [
+            ("Log_start", "cur_log_start", self.log_start, 1.0),
+            ("Log_end",   "cur_log_end",   self.log_end,   7.0),
+        ]:
+            tspin = TimeLogSpinBox()
+            tspin.setValue(log_default)
+            tspin.valueChanged.connect(func)
+            tspin.setFixedSize(170, 26)
+            setattr(self, attr_name, tspin)
+            setattr(self, par_name, float(tspin.value()))
+
+        self.Log_start.setToolTip('Pulses with a log-step can be specified using the Start Increment parameter in the Pulses tab. Only relative increments of the pulses are important.\nA non-zero X0 sets the X-axis start point; otherwise the detection pulse timing (or the first pulse with a non-zero Start Increment) is used.')
+        self.Log_end.setToolTip('Pulses with a log-step can be specified using the Start Increment parameter in the Pulses tab. Only relative increments of the pulses are important.\nA non-zero X0 sets the X-axis start point; otherwise the detection pulse timing (or the first pulse with a non-zero Start Increment) is used.')
+
+        # ---- Text Edits ----
+        text_edit = [("EXP", "text_edit_exp_name", "cur_exp_name", self.exp_name),
+                     ("c1", "text_edit_curve", "cur_curve_name", self.curve_name)
+                    ]
+
+        for text, attr_name, par_name, func in text_edit:
+            txt = QTextEdit(text)
+            setattr(self, attr_name, txt)
+            setattr(self, par_name, txt.toPlainText())
+            txt.textChanged.connect(func)
+            txt.setFixedSize(170, 26)
+            txt.setAcceptRichText(False)
+            txt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            txt.setStyleSheet(REFINED_STYLES['COMPACT_TEXT_STYLE'])
+            txt.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+
+        # ---- Combo boxes----
+        combo_boxes = [("Linear Time", "combo_sweep", "cur_sweep", self.sweep_type, 
+                        [
+                        "Linear Time", "Field", "Log Time"
+                        ])
+                      ]
+
+        for cur_text, attr_name, par_name, func, item in combo_boxes:
+            combo = QComboBox()
+            setattr(self, attr_name, combo)
+            setattr(self, par_name, combo.currentText())
+            combo.currentIndexChanged.connect(func)
+            combo.addItems(item)
+            combo.setCurrentText(cur_text)
+            combo.setFixedSize(170, 26)
+            combo.setStyleSheet(REFINED_STYLES['COMBO_STYLE'])
+
+        self.combo_sweep.setToolTip('Linear Time: standard linear delay/length increment experiment.\nField: field-sweep experiment.\nLog Time: log10 delay/length increment experiment.')
+
+        # ---- Separators ----
+        def hline():
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setFrameShadow(QFrame.Shadow.Sunken)
+            line.setLineWidth(2)
+            return line
+
+        container_layout = QHBoxLayout()
+
+        left_grid = QGridLayout()
+        left_grid.setVerticalSpacing(4)
+        left_grid.setHorizontalSpacing(20)
+        left_grid.addWidget(self.label_17, 0, 0)
+        left_grid.addWidget(self.Acq_number, 0, 1)
+        left_grid.addWidget(hline(), 1, 0, 1, 2)
+
+        left_grid.addWidget(self.label_e1, 2, 0)
+        left_grid.addWidget(self.box_points, 2, 1)
+        left_grid.addWidget(self.label_e2, 3, 0)
+        left_grid.addWidget(self.box_scan, 3, 1)
+        left_grid.addWidget(hline(), 4, 0, 1, 2)
+
+        left_grid.addWidget(self.label_e7, 5, 0)
+        left_grid.addWidget(self.X0, 5, 1)
+        left_grid.addWidget(self.label_e8, 6, 0)
+        left_grid.addWidget(self.XDelta, 6, 1)
+
+        left_grid.addWidget(hline(), 8, 0, 1, 2)
+
+        left_grid.addWidget(self.label_e5, 9, 0)
+        left_grid.addWidget(self.Log_start, 9, 1)
+        left_grid.addWidget(self.label_e6, 10, 0)
+        left_grid.addWidget(self.Log_end, 10, 1)
+
+        left_grid.addWidget(hline(), 11, 0, 1, 2)
+
+        left_grid.addWidget(self.label_e3, 12, 0)
+        left_grid.addWidget(self.text_edit_exp_name, 12, 1)
+        left_grid.addWidget(self.label_e4, 13, 0)
+        left_grid.addWidget(self.text_edit_curve, 13, 1)
+
+        left_grid.addWidget(hline(), 14, 0, 1, 2)
+
+        right_grid = QGridLayout()
+        right_grid.setVerticalSpacing(4)
+        right_grid.setHorizontalSpacing(20)
+        right_grid.addWidget(self.label_18, 0, 0)
+        right_grid.addWidget(self.Win_left, 0, 1)
+        right_grid.addWidget(self.label_19, 1, 0)
+        right_grid.addWidget(self.Win_right, 1, 1)
+        right_grid.addWidget(self.label_20, 2, 0)
+        right_grid.addWidget(self.Dec, 2, 1)
+        aw_controls = QWidget()
+        aw_controls.setFixedSize(360, 26)
+        aw_layout = QHBoxLayout(aw_controls)
+        aw_layout.setContentsMargins(0, 0, 0, 0)
+        aw_layout.setSpacing(0)
+        self.label_aw.setFixedSize(140, 26)
+        aw_layout.addWidget(self.label_aw)
+        aw_layout.addSpacing(20)
+        self.button_auto_window = QPushButton("A")
+        self.button_auto_window.setFixedSize(26, 26)
+        self._set_glyph_style(self.button_auto_window,
+            REFINED_STYLES['DOCK_CLOSE_STYLE'] + "QPushButton { font-size: 15px; }")
+        self.button_auto_window.setAccessibleName("Auto window")
+        self.button_auto_window.setToolTip(
+            "Auto window: centre an integration window of the given width on the echo "
+            "maximum and update Integration Left/Right. Needs a running preview.")
+        self.button_auto_window.clicked.connect(self.auto_window)
+        aw_layout.addWidget(self.button_auto_window)
+        aw_layout.addSpacing(4)
+        aw_layout.addWidget(self.Win_width)
+        right_grid.addWidget(aw_controls, 3, 0, 1, 2)
+        right_grid.addWidget(hline(), 4, 0, 1, 2)
+        right_grid.setRowStretch(5, 1)
+        right_grid.setColumnStretch(4, 1)
+
+        third_grid = QGridLayout()
+        third_grid.setVerticalSpacing(4)
+        third_grid.setHorizontalSpacing(20)
+        third_grid.addWidget(self.label_f1, 0, 0)
+        third_grid.addWidget(self.box_st_field, 0, 1)
+        third_grid.addWidget(self.label_f2, 1, 0)
+        third_grid.addWidget(self.box_end_field, 1, 1)
+        third_grid.addWidget(self.label_f3, 2, 0)
+        third_grid.addWidget(self.box_step_field, 2, 1)
+        third_grid.addWidget(hline(), 3, 0, 1, 2)
+        third_grid.setRowStretch(4, 1)
+        third_grid.setColumnStretch(4, 1)
+
+        forth_grid = QGridLayout()
+        forth_grid.setVerticalSpacing(4)
+        forth_grid.setHorizontalSpacing(20)
+        forth_grid.addWidget(self.label_c1, 0, 0)
+        forth_grid.addWidget(self.combo_sweep, 0, 1)
+        forth_grid.addWidget(hline(), 1, 0, 1, 2)
+        forth_grid.setRowStretch(2, 1)
+        forth_grid.setColumnStretch(2, 1)
+
+        container_layout.addLayout(left_grid)
+        container_layout.addSpacing(20)
+        container_layout.addLayout(right_grid)
+        container_layout.addSpacing(20)
+        container_layout.addLayout(third_grid)
+        container_layout.addSpacing(20)
+        container_layout.addLayout(forth_grid)
+
+        container_layout.addStretch(1) 
+        gridLayout.addLayout(container_layout, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+        gridLayout.setColumnStretch(1, 1)
+        gridLayout.setRowStretch(1, 1)
+
+    def design_tab_3(self):
+        fft_setting_page = QWidget()
+        gridLayout = QGridLayout()
+        gridLayout.setContentsMargins(15, 15, 10, 10)
+        gridLayout.setVerticalSpacing(4)
+        gridLayout.setHorizontalSpacing(20)
+
+        fft_setting_page.setLayout(gridLayout)
+
+        self.tab_pulse.addTab(fft_setting_page, "FFT")
+        self.tab_pulse.tabBar().setTabTextColor(2, QColor(193, 202, 227))
+
+        # ---- Labels & Inputs ----
+        labels = [("Points to Drop", "label_11"), ("Zero Order", "label_12"), ("First Order", "label_13"), ("Second Order", "label_14"), ("Live FFT", "label_15"), ("Phase Correction", "label_16")
+            ]
+
+        for name, attr_name in labels:
+            lbl = QLabel(name)
+            setattr(self, attr_name, lbl)
+            lbl.setFixedSize(170, 26)
+            lbl.setStyleSheet(REFINED_STYLES['LABEL_STYLE'])
+
+        # ---- Boxes ----
+        double_boxes = [(QSpinBox, "P_to_drop", "p_to_drop", self.p_to_drop_func, 0, 37500, 0, 1, 0, " pts"),
+                      (QDoubleSpinBox, "Zero_order", "zero_order", self.zero_order_func, -0.1, 360.1, 0, 0.1, 4, " deg"),
+                      (QDoubleSpinBox, "First_order", "first_order", self.first_order_func, -5400, 5400, 0, 0.001, 4, " deg/MHz"),
+                      (QDoubleSpinBox, "Second_order", "second_order", self.second_order_func, -100, 100, 0, 0.001, 4, ' deg/MHz²')
+                        ]
+
+        for widget_class, attr_name, par_name, func, v_min, v_max, cur_val, v_step, dec, suf in double_boxes:
+            spin_box = widget_class()
+            if isinstance(spin_box, QDoubleSpinBox):
+                spin_box.setRange(v_min, v_max)
+                spin_box.setStyleSheet(REFINED_STYLES['COMPACT_FIELD_STYLE'])
+            else:
+                spin_box.setRange(int(v_min), int(v_max))
+                spin_box.setStyleSheet(REFINED_STYLES['COMPACT_FIELD_STYLE'])
+            spin_box.setSingleStep(v_step)
+            spin_box.setValue(cur_val)
+            if isinstance(spin_box, QDoubleSpinBox):
+                spin_box.setDecimals(dec)
+            spin_box.setSuffix(suf)
+            spin_box.valueChanged.connect(func)
+            spin_box.setFixedSize(170, 26)
+            spin_box.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.PlusMinus)
+
+            spin_box.setKeyboardTracking( False )
+            spin_box.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu) 
+
+            setattr(self, attr_name, spin_box)
+            if isinstance(spin_box, QDoubleSpinBox):
+                if attr_name == 'Zero_order':
+                    setattr(self, par_name, float(spin_box.value() / self.deg_rad))
+                elif attr_name == 'First_order':
+                    setattr(self, par_name, float(spin_box.value() / self.first_order_coef))
+                else:
+                    setattr(self, par_name, float(spin_box.value() / self.sec_order_coef))
+
+            else:
+                setattr(self, par_name, int(spin_box.value()))
+
+        self.P_to_drop.setToolTip('Discard this many leading samples before the FFT in frequency-domain phase mode.')
+        
+        #if self.second_order != 0.0:
+        #    self.second_order = self.sec_order_coef / ( float( self.Second_order.value() ) * 1000 )
+
+        self.l_mode = 0
+
+        # ---- Check Boxes ----
+        check_boxes = [("fft_box", self.fft_online),
+                       ("Quad_cor", self.quad_online)
+                       ]
+
+        for attr_name, func in check_boxes:
+            check = QCheckBox("")
+            setattr(self, attr_name, check)
+            check.stateChanged.connect(func)
+            check.setStyleSheet(CHECKBOX_STYLE)
+            check.setFixedSize(170, 26)
+
+
+        self.fft_box.setToolTip('Show the FFT; Phase Correction selects amplitude or phase-corrected I/Q.')
+        
+        self.Quad_cor.setToolTip('Unchecked: Zero Order on the time trace, with Auto phase. Checked: orders 0–2 on the FFT after Points to Drop; Auto phase is disabled. First and Second Order affect only the FFT view.')
+
+        # ---- Separators ----
+        def hline():
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setFrameShadow(QFrame.Shadow.Sunken)
+            line.setLineWidth(2)
+            return line
+
+
+        # ---- Layout placement ----
+        gridLayout.addWidget(self.label_15, 0, 0)
+        gridLayout.addWidget(self.fft_box, 0, 1)
+        gridLayout.addWidget(self.label_16, 1, 0)
+        gridLayout.addWidget(self.Quad_cor, 1, 1)
+
+        gridLayout.addWidget(hline(), 2, 0, 1, 2)
+        
+        gridLayout.addWidget(self.label_11, 3, 0)
+        gridLayout.addWidget(self.P_to_drop, 3, 1)
+        zo_controls = QWidget()
+        zo_controls.setFixedSize(360, 26)
+        zo_layout = QHBoxLayout(zo_controls)
+        zo_layout.setContentsMargins(0, 0, 0, 0)
+        zo_layout.setSpacing(0)
+        self.label_12.setFixedSize(140, 26)
+        zo_layout.addWidget(self.label_12)
+        zo_layout.addSpacing(20)
+        self.button_auto_phase = QPushButton("A")
+        self.button_auto_phase.setFixedSize(26, 26)
+        self._set_glyph_style(self.button_auto_phase,
+            REFINED_STYLES['DOCK_CLOSE_STYLE'] + "QPushButton { font-size: 15px; }")
+        self.button_auto_phase.setAccessibleName("Auto phase")
+        self.button_auto_phase.setToolTip(
+            "Auto phase: set Zero Order so the I/Q integral over the Integration Left/Right "
+            "window falls on the I axis. Needs a running preview with Phase Correction unchecked.")
+        self.button_auto_phase.clicked.connect(self.auto_phase)
+        zo_layout.addWidget(self.button_auto_phase)
+        zo_layout.addSpacing(4)
+        zo_layout.addWidget(self.Zero_order)
+        gridLayout.addWidget(zo_controls, 4, 0, 1, 2)
+        gridLayout.addWidget(self.label_13, 5, 0)
+        gridLayout.addWidget(self.First_order, 5, 1)
+        gridLayout.addWidget(self.label_14, 6, 0)
+        gridLayout.addWidget(self.Second_order, 6, 1)
+
+        gridLayout.addWidget(hline(), 7, 0, 1, 2)
+
+        gridLayout.setRowStretch(8, 2)
+        gridLayout.setColumnStretch(8, 2)
+
+        # flag for not writing the data when digitizer is off
+        self.opened = 0
+        self.fft = 0
+        self.quad = 0
+        self.double_change = 0
+        self.quad_online()
+
+    def design_tab_4(self):
+        laser_setting_page = QWidget()
+        gridLayout = QGridLayout()
+        gridLayout.setContentsMargins(15, 15, 10, 10)
+        gridLayout.setVerticalSpacing(4)
+        gridLayout.setHorizontalSpacing(20)
+
+        laser_setting_page.setLayout(gridLayout)
+
+        self.tab_pulse.addTab(laser_setting_page, "Source / Laser")
+        self.tab_pulse.tabBar().setTabTextColor(3, QColor(193, 202, 227))
+
+        # ---- Labels & Inputs ----
+        labels = [("Laser Type", "label_0")]
+
+        for name, attr_name in labels:
+            lbl = QLabel(name)
+            setattr(self, attr_name, lbl)
+            lbl.setFixedSize(170, 26)
+            lbl.setStyleSheet(REFINED_STYLES['LABEL_STYLE'])
+
+        # ---- Combo box----
+        combo_laser = ["Nd:YaG", "Combo_laser", "", self.combo_laser_fun, ["Nd:YaG", "NovoFEL"]]
+
+        combo = QComboBox()
+        setattr(self, combo_laser[1], combo)
+        combo.currentIndexChanged.connect(combo_laser[3])
+        combo.addItems(combo_laser[4])
+        combo.setCurrentText(combo_laser[0])
+        combo.setFixedSize(170, 26)
+        combo.setStyleSheet(REFINED_STYLES['COMBO_STYLE'])
+
+        self.combo_laser_fun()
+
+        # ---- Separators ----
+        def hline():
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setFrameShadow(QFrame.Shadow.Sunken)
+            line.setLineWidth(2)
+            return line
+
+        # ---- Layout placement ----
+        gridLayout.addWidget(self.label_0, 0, 0)
+        gridLayout.addWidget(self.Combo_laser, 0, 1)
+
+        gridLayout.addWidget(hline(), 1, 0, 1, 2)
+
+        gridLayout.setRowStretch(2, 1)
+        gridLayout.setColumnStretch(2, 1)
+
+    def design_tab_5(self):
+        settings_page = QWidget()
+        gridLayout = QGridLayout()
+        gridLayout.setContentsMargins(15, 15, 10, 10)
+        gridLayout.setVerticalSpacing(4)
+        gridLayout.setHorizontalSpacing(20)
+
+        settings_page.setLayout(gridLayout)
+
+        self.tab_pulse.addTab(settings_page, "Settings")
+        self.tab_pulse.tabBar().setTabTextColor(4, QColor(193, 202, 227))
+
+        # ---- Separator ----
+        def hline():
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setFrameShadow(QFrame.Shadow.Sunken)
+            line.setLineWidth(2)
+            return line
+
+        # ---- Live Edit controls ----
+        live_label = QLabel("Live Mode")
+        live_label.setFixedSize(170, 26)
+        live_label.setStyleSheet(REFINED_STYLES['LABEL_STYLE'])
+        self.live_edit_box = QCheckBox("")
+        self.live_edit_box.setStyleSheet(CHECKBOX_STYLE)
+        self.live_edit_box.setFixedSize(170, 26)
+        self.live_edit_box.setToolTip(
+            "When enabled, edits to a pulse's Start and Length are applied to the "
+            "running sequence immediately, without restarting the card. Changing the "
+            "channel/type, phase-cycle length, the number of pulses, or decimation "
+            "triggers an automatic restart instead. No effect until a sequence is "
+            "running.")
+        self.live_edit_box.stateChanged.connect(self.live_edit_toggle)
+
+        debounce_label = QLabel("Apply Delay")
+        debounce_label.setFixedSize(170, 26)
+        debounce_label.setStyleSheet(REFINED_STYLES['LABEL_STYLE'])
+        self.Debounce = QSpinBox()
+        self.Debounce.setRange(200, 5000)
+        self.Debounce.setSingleStep(50)
+        self.Debounce.setValue(800)
+        self.Debounce.setSuffix(" ms")
+        self.Debounce.setFixedSize(170, 26)
+        self.Debounce.setButtonSymbols(QSpinBox.ButtonSymbols.PlusMinus)
+        self.Debounce.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.Debounce.setStyleSheet(REFINED_STYLES['COMPACT_FIELD_STYLE'])
+        self.Debounce.setToolTip("Delay after the last pulse edit before it is pushed to the running sequence.")
+
+        gridLayout.addWidget(live_label, 0, 0)
+        gridLayout.addWidget(self.live_edit_box, 0, 1)
+        gridLayout.addWidget(debounce_label, 1, 0)
+        gridLayout.addWidget(self.Debounce, 1, 1)
+        gridLayout.addWidget(hline(), 2, 0, 1, 2)
+
+        # ---- Accumulation mode (preview readout) ----
+        accum_controls = QWidget()
+        accum_controls.setFixedSize(360, 26)
+        accum_layout = QHBoxLayout(accum_controls)
+        accum_layout.setContentsMargins(0, 0, 0, 0)
+        accum_layout.setSpacing(0)
+        accum_label = QLabel("Accumulation Mode")
+        accum_label.setFixedSize(140, 26)
+        accum_label.setStyleSheet(REFINED_STYLES['LABEL_STYLE'])
+        accum_layout.addWidget(accum_label)
+        accum_layout.addSpacing(20)
+        self.accum_box = QCheckBox("")
+        self.accum_box.setStyleSheet(CHECKBOX_STYLE)
+        self.accum_box.setFixedSize(170, 26)
+        self.accum_box.setToolTip(
+            "Preview readout mode. Off (default): live snapshot — every phase "
+            "step shows just the newest on-board average, so pulse edits show "
+            "up immediately. On: the digitizer keeps the phase-cycle-combined "
+            "running average of the whole preview, so a weak echo grows out "
+            "of the noise the longer it runs; the accumulated buffer is never "
+            "cleared, so any pulse edit needs a preview restart. Requires a "
+            "phase cycle (2+ steps). Applied on the next preview start.")
+        self.accum_box.stateChanged.connect(self.accumulation_toggle)
+        self.button_reset_accum = QPushButton("×")
+        self.button_reset_accum.setFixedSize(26, 26)
+        self._set_glyph_style(self.button_reset_accum,
+            REFINED_STYLES['DOCK_CLOSE_STYLE'] + "QPushButton { font-size: 16px; }")
+        self.button_reset_accum.setAccessibleName("Reset accumulated data")
+        self.button_reset_accum.setToolTip(
+            "Reset the accumulated average: the running preview starts accumulating anew "
+            "without a restart. Works only in a running accumulation preview.")
+        self.button_reset_accum.clicked.connect(self.reset_accumulation)
+        accum_layout.addWidget(self.button_reset_accum)
+        accum_layout.addSpacing(4)
+        accum_layout.addWidget(self.accum_box)
+        gridLayout.addWidget(accum_controls, 3, 0, 1, 2)
+        gridLayout.addWidget(hline(), 4, 0, 1, 2)
+
+        gridLayout.setColumnStretch(2, 1)
+        gridLayout.setRowStretch(5, 1)
+
+        # All pulse spin-boxes now exist; snapshot their values so the first
+        # linked edit computes the correct delta.
+        self._seed_link_prev()
+
+    # ---- Link mode helpers ----
+    def _link_suffix(self):
+        """Spin-box suffix for the currently coupled parameter, or None."""
+        return {'Length': '_len', 'Position': '_st'}.get(self.link_param)
+
+    def _seed_link_prev(self):
+        for suf in ('_st', '_len'):
+            for i in range(1, 10):
+                box = getattr(self, f"P{i}{suf}", None)
+                if box is not None:
+                    self._link_prev[(suf, i)] = box.value()
+
+    def link_param_changed(self):
+        self.link_param = self.Combo_link_pulses.currentData()
+        self._link_message()
+
+    def reset_links(self):
+        """Clear pulse coupling without changing pulse values."""
+        self.Combo_link_pulses.setCurrentIndex(0)
+        for i in range(1, 10):
+            getattr(self, f"P{i}_lk").setCurrentText("No")
+
+    def accumulation_toggle(self):
+        """
+        Preview readout mode ('Accumulation Mode' in Settings). l_mode = 0
+        (default): live snapshot — each phase step shows the newest on-board
+        average only. l_mode = 1: the digitizer accumulates the phase-cycled
+        average across the whole preview (the exp-style readout), for pulling
+        a weak echo out of the noise.
+
+        The mode is baked into the worker at launch (dig_on's l_mode) and
+        the accumulation buffer is never cleared on a parameter change, so
+        it cannot switch under a running sequence: block the toggle during a
+        full experiment (revert the box) and stop a running preview so the
+        operator restarts in the new mode.
+        """
+        if getattr(self, 'is_experiment', False):
+            self.accum_box.blockSignals(True)
+            self.accum_box.setChecked(self.l_mode == 1)
+            self.accum_box.blockSignals(False)
+            self.message('Cannot change the preview readout mode while an experiment is running.')
+            return
+        self.l_mode = 1 if self.accum_box.isChecked() else 0
+        if self._live_run_alive():
+            self.dig_stop()
+        self.message('Accumulation mode: '
+                     + ('ON — the preview averages over its whole run; pulse '
+                        'edits need a preview restart'
+                        if self.l_mode == 1 else 'OFF (live snapshot)'))
+
+    def reset_accumulation(self):
+        """Clear the running preview's accumulated average in place."""
+        if self.l_mode != 1 or getattr(self, 'is_testing', False) or not self._live_run_alive():
+            self.message('Accumulation reset: start the preview in Accumulation Mode first.')
+            return
+        self.parent_conn_dig.send('AR')
+        self.errors.appendPlainText('Accumulation reset: averaging restarted.')
+
+    def update_link_factor(self, index):
+        txt = getattr(self, f"P{index}_lk").currentText()
+        self.link_factor[index] = {'No': 0.0, '0.5x': 0.5, '1x': 1.0, '2x': 2.0}.get(txt, 0.0)
+        self._link_message()
+
+    def _link_message(self, text = ''):
+        """Show one temporary link notice in the message history."""
+        if not hasattr(self, 'errors'):
+            return
+        previous = getattr(self, '_link_notice', '')
+        cursor = self.errors.document().find(previous) if previous else QTextCursor()
+        if not cursor.isNull() and cursor.block().text() == previous:
+            if text == previous:
+                return
+            cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+            if cursor.block().next().isValid():
+                cursor.movePosition(QTextCursor.MoveOperation.NextBlock, QTextCursor.MoveMode.KeepAnchor)
+            else:
+                if cursor.position() > 0:
+                    cursor.movePosition(QTextCursor.MoveOperation.PreviousCharacter)
+                cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+        self._link_notice = text
+        if not text:
+            return
+        self.errors.appendPlainText(text)
+
+    def link_source_changed(self, index, suffix):
+        """A linkable spin-box changed: shift the other linked pulses in step."""
+        box = getattr(self, f"P{index}{suffix}")
+        new_val = box.value()
+        prev = self._link_prev.get((suffix, index), new_val)
+        self._link_prev[(suffix, index)] = new_val
+
+        # Re-entrancy guard (we are the one moving the other boxes), inactive
+        # parameter, or this pulse is not linked -> nothing to propagate.
+        if self._linking or suffix != self._link_suffix():
+            return
+        f_edit = self.link_factor.get(index, 0.0)
+        if f_edit == 0.0:
+            return
+        delta = new_val - prev
+        if delta == 0:
+            return
+
+        unit = delta / f_edit
+        self._linking = True
+        clamped = False
+        try:
+            for j in range(1, 10):
+                if j == index:
+                    continue
+                f_j = self.link_factor.get(j, 0.0)
+                if f_j == 0.0:
+                    continue
+                box_j = getattr(self, f"P{j}{suffix}", None)
+                if box_j is None:
+                    continue
+                # A fixed-range box (min == max) cannot be shifted -- skip it so a
+                # coupled edit neither no-ops against it nor trips the warning.
+                if box_j.maximum() - box_j.minimum() < 1e-9:
+                    continue
+                shift = unit * f_j
+                # For grid-quantised position/length, the snap re-fired by
+                # setValue (round_to_closest) CEILS a fractional shift up to the
+                # next grid step, so a 0.5x link factor would drag a coupled
+                # pulse a full step on +delta and nothing on -delta -- a one-way
+                # ratchet. Snap the SHIFT to the nearest grid step here so
+                # fractional factors round symmetrically (0.5x on a single-step
+                # edit -> no move); the box is already on-grid, so setValue's own
+                # snap then no-ops.
+                if suffix in ('_st', '_len'):
+                    grid = 3.2  # RECT pulse time grid (ns)
+                    shift = round(shift / grid) * grid
+                target = box_j.value() + shift
+                # QDoubleSpinBox silently clamps to its range; a coupled shift can
+                # drive a linked pulse past a limit (e.g. the length ceiling), so
+                # flag it -- the coupling is then no longer strictly proportional.
+                if target > box_j.maximum() + 1e-9 or target < box_j.minimum() - 1e-9:
+                    clamped = True
+                box_j.setValue(target)
+                self._link_prev[(suffix, j)] = box_j.value()
+        finally:
+            self._linking = False
+
+        if clamped:
+            self._link_message('Link: a coupled value hit its limit and was clamped; '
+                         'the link is no longer proportional.')
+        else:
+            self._link_message()
+
+    def x0(self):
+        self.cur_x0 = self.round_and_change_no_ns(self.X0)
+    
+    def xdelta(self):
+        self.cur_xdelta = self.round_and_change_no_ns(self.XDelta)
+
+    def log_start(self):
+        self.cur_log_start = round( float( self.Log_start.value() ), 3 )
+
+    def log_end(self):
+        self.cur_log_end = round( float( self.Log_end.value() ), 3 )
+
+    def end_field(self):
+        """
+        A function to send an end field value
+        """
+        self.cur_end_field = round( float( self.box_end_field.value() ), 3 )
+
+    def st_field(self, value):
+        """
+        A function to send a start field value
+        """
+        self.cur_start_field = round( float( value ), 3 )
+
+    def step_field(self):
+        """
+        A function to send a step field value
+        """
+        self.cur_step = round( float( self.box_step_field.value() ), 3 )
+
+    def sweep_type(self):
+        self.cur_sweep = self.combo_sweep.currentText()
+        #Linear Time; Field; Log Time
+
+    def curve_name(self):
+        self.cur_curve_name = self.text_edit_curve.toPlainText()
+        #print( self.cur_curve_name )
+
+    def exp_name(self):
+        self.cur_exp_name = self.text_edit_exp_name.toPlainText()
+        #print( self.cur_exp_name )
+
+    def scan(self):
+        """
+        A function to send a number of scans
+        """
+        self.cur_scan = int( self.box_scan.value() )
+        try:
+            self.parent_conn_dig.send( 'SC' + str( self.cur_scan ) )
+        except AttributeError:
+            pass
+
+    def points(self):
+        self.cur_points = int( self.box_points.value() )
+        #print(self.cur_start_field)
+
+    def start_exp(self):
+        if self.is_experiment == True:
+            return
+
+        self.dig_stop()
+        self.dig_start_exp()
+
+    def stop_exp(self):
+        self.dig_stop()
+
+    def combo_laser_fun(self):
+        """
+        A function to set a default laser
+        """
+        txt = str( self.Combo_laser.currentText() )
+        if txt == 'Nd:YaG':
+            self.combo_laser_num = 1
+            self.laser_q_switch_delay = 0
+        elif txt == 'NovoFEL':
+            self.combo_laser_num = 2
+            self.laser_q_switch_delay = 0
+        self._raise_laser_len_ndyag()
+        self.schedule_live_apply()
+
+    def _raise_laser_len_ndyag(self):
+        """Nd:YAG needs laser trigger pulses of at least 1000 ns: lengthen shorter LASER rows to the minimum."""
+        if getattr(self, 'combo_laser_num', 0) != 1:
+            return
+        changed = False
+        self._linking = True
+        try:
+            for i in range(2, 2 + getattr(self, 'laser_flag', 0)):
+                box = getattr(self, f'P{i}_len', None)
+                if box is not None and box.value() < 1000:
+                    box.setValue(1001.6)
+                    changed = True
+        finally:
+            self._linking = False
+        if changed:
+            self._seed_link_prev()
+
+    def quad_online(self):
+        """
+        Select time-domain zero order or frequency-domain orders 0–2
+        """
+        self.clear_track(fft_only=True)
+        if self.Quad_cor.checkState().value == 2: # checked
+            self.quad = 1
+        elif self.Quad_cor.checkState().value == 0: # unchecked
+            self.quad = 0
+        
+        self.button_auto_phase.setEnabled(self.quad == 0)
+        self.First_order.setEnabled(self.quad == 1)
+        self.Second_order.setEnabled(self.quad == 1)
+        self.P_to_drop.setEnabled(self.quad == 1)
+
+        try:
+            self.parent_conn_dig.send( 'QC' + str( self.quad ) )
+        except AttributeError:
+            pass
+
+    def zero_order_func(self):
+        """
+        A function to change the zero order phase correction value
+        """
+        self.zero_order = float( self.Zero_order.value() ) / self.deg_rad
+
+        # cycling
+        if self.zero_order < 0.0:
+            self.Zero_order.setValue(360.0)
+            self.zero_order = float( self.Zero_order.value() )/ self.deg_rad
+        else:
+            pass
+
+        if self.zero_order > 2*np.pi:
+            self.Zero_order.setValue(0.0)
+            self.zero_order = float( self.Zero_order.value() ) / self.deg_rad
+        else:
+            pass
+
+        if self.opened == 0:
+            try:
+                self.parent_conn_dig.send( 'ZO' + str( self.zero_order ) )
+            except AttributeError:
+                pass
+
+    @staticmethod
+    def _set_glyph_style(button, style):
+        """Apply style and centre the button glyph by its ink rather than its line box."""
+        button.setStyleSheet(style)
+        button.ensurePolished()
+        fm = button.fontMetrics()
+        ink = fm.tightBoundingRect(button.text())
+        pad = round(2 * ink.top() + ink.height() + fm.ascent() - fm.descent())
+        side = 'bottom' if pad > 0 else 'top'
+        button.setStyleSheet(style + f"QPushButton {{ padding-{side}: {abs(pad)}px; }}")
+
+    def _track_available(self):
+        return (not getattr(self, 'is_testing', False)
+                and not getattr(self, 'stop_requested', False)
+                and self._live_run_alive())
+
+    def track_curves(self):
+        """Freeze the displayed live curves through the main window."""
+        if self._track_available():
+            self._track_command('capture')
+        self.button_track.setEnabled(self._track_available())
+
+    def _track_command(self, action):
+        proc = getattr(self, 'digitizer_process', None)
+        self.message('track ' + json.dumps({
+            'action': action, 'pid': getattr(proc, 'pid', None),
+            'fft': bool(self.fft), 'quad': self.quad,
+        }))
+
+    def clear_track(self, fft_only=False):
+        self._track_command('clear_fft' if fft_only else 'clear')
+
+    def auto_phase(self):
+        """Ask the running preview for the zero-order phase of its integrated I/Q."""
+        if getattr(self, 'is_experiment', False):
+            self.message('Auto phase works only in the preview, not during an experiment.')
+            return
+        if getattr(self, 'is_testing', False) or not self._live_run_alive():
+            self.message('Auto phase: start the preview and wait for preflight to finish.')
+            return
+        if self.Quad_cor.isChecked():
+            self.message('Auto phase: uncheck Phase Correction to use time-domain Zero Order.')
+            return
+        self.parent_conn_dig.send('AP')
+
+    def auto_window(self):
+        """Ask the running preview to centre the integration window on the echo."""
+        if getattr(self, 'is_experiment', False):
+            self.message('Auto window works only in the preview, not during an experiment.')
+            return
+        if getattr(self, 'is_testing', False) or not self._live_run_alive():
+            self.message('Auto window: start the preview and wait for preflight to finish.')
+            return
+        width_pts = max(1, int(round(self.win_width / self.time_per_point)))
+        self.parent_conn_dig.send('AW' + str(width_pts))
+
+    def first_order_func(self):
+        """
+        A function to change the first order phase correction value
+        """
+        self.first_order = float( self.First_order.value() ) / self.first_order_coef
+
+        if self.opened == 0:
+            try:
+                self.parent_conn_dig.send( 'FO' + str( self.first_order ) )
+            except AttributeError:
+                pass
+
+    def second_order_func(self):
+        """
+        A function to change the second order phase correction value
+        """
+        self.second_order = float( self.Second_order.value() ) / self.sec_order_coef
+        
+        if self.opened == 0:
+            try:
+                self.parent_conn_dig.send( 'SO' + str( self.second_order ) )
+            except AttributeError:
+                pass
+
+    def p_to_drop_func(self):
+        """
+        A function to change the number of points to drop
+        """
+        self.p_to_drop = int( self.P_to_drop.value() )
+
+        if self.opened == 0:
+            try:
+                self.parent_conn_dig.send( 'PD' + str( self.p_to_drop ) )
+            except AttributeError:
+                pass
+
+    def fft_online(self):
+        """
+        Turn on/off FFT
+        """
+
+        self.clear_track(fft_only=True)
+        if self.fft_box.checkState().value == 2: # checked
+            self.fft = 1
+        elif self.fft_box.checkState().value == 0: # unchecked
+            self.fft = 0
+        
+        try:
+            self.parent_conn_dig.send( 'FF' + str( self.fft ) )
+        except AttributeError:
+            pass
+
+    def win_left(self):
+        """
+        A function to change left integration window
+        """
+        self.cur_win_left = points_from_ns( self.Win_left.value(), self.time_per_point )
+        if round( self.cur_win_left * self.time_per_point, 1) > round( float( self.remove_ns( self.p1_length ) ), 1):
+            self.cur_win_left = points_from_ns( round( float( self.remove_ns( self.p1_length ) ), 1), self.time_per_point )
+            self.Win_left.setValue( round( self.cur_win_left * self.time_per_point, 1) )
+        
+        if self.opened == 0:
+            try:
+                self.parent_conn_dig.send( 'WL' + str( self.cur_win_left ) )
+            except AttributeError:
+                pass
+
+    def win_right(self):
+        self.cur_win_right = points_from_ns( self.Win_right.value(), self.time_per_point )
+        if round( self.cur_win_right * self.time_per_point, 1) > round( float( self.remove_ns( self.p1_length ) ), 1):
+            self.cur_win_right = points_from_ns( round( float( self.remove_ns( self.p1_length ) ), 1), self.time_per_point )
+            self.Win_right.setValue( round( self.cur_win_right * self.time_per_point, 1) )
+
+        if self.opened == 0:
+            try:
+                self.parent_conn_dig.send( 'WR' + str( self.cur_win_right ) )
+            except AttributeError:
+                pass
+
+    def win_width_func(self):
+        """
+        A function to change the auto window width
+        """
+        self.win_width = float( self.Win_width.value() )
+
+    def acq_number(self):
+        """
+        A function to change number of averages
+        """
+        self.number_averages = int( self.Acq_number.value() )
+
+        #if self.opened == 0:
+        try:
+            self.parent_conn_dig.send( 'NA' + str( self.number_averages ) )
+        except AttributeError:
+            pass
+
+    def open_file_dialog(self):
+        """
+        A function to open a new window for choosing a pulse list
+        """
+        filedialog = QFileDialog(self, 'Open File', directory = ldir.load('phase', self.path), filter = "Pulse Phase List (*.phase)", options = QFileDialog.Option.DontUseNativeDialog)
+        
+        filedialog.setMinimumWidth(800)
+        tree = filedialog.findChild(QTreeView)
+        header = tree.header()
+        for i in range(header.count()):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+
+        buttons = filedialog.findChildren(QPushButton)
+        seen_texts = []
+        for btn in buttons:
+            if btn.text() in seen_texts:
+                btn.hide()
+            else:
+                seen_texts.append(btn.text())
+        
+        line_edit = filedialog.findChild(QLineEdit)
+
+        if line_edit:
+            line_edit.setCompleter(None)
+
+        size_grip = filedialog.findChild(QSizeGrip)
+        if size_grip:
+            size_grip.setVisible(False)
+
+        style_file_dialog(filedialog)
+        
+        filedialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        filedialog.fileSelected.connect(self.open_file)
+        filedialog.show()
+
+    def save_file_dialog(self):
+        """
+        A function to open a new window for choosing a pulse list
+        """
+        filedialog = QFileDialog(self, 'Save File', directory = ldir.load('phase', self.path), filter = "Pulse Phase List (*.phase)", options = QFileDialog.Option.DontUseNativeDialog)
+        filedialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        filedialog.setMinimumWidth(800)
+
+        tree = filedialog.findChild(QTreeView)
+        header = tree.header()
+        for i in range(header.count()):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+
+        buttons = filedialog.findChildren(QPushButton)
+        seen_texts = []
+        for btn in buttons:
+            if btn.text() in seen_texts:
+                btn.hide()
+            else:
+                seen_texts.append(btn.text())
+        
+        line_edit = filedialog.findChild(QLineEdit)
+
+        if line_edit:
+            line_edit.setCompleter(None)
+
+        size_grip = filedialog.findChild(QSizeGrip)
+        if size_grip:
+            size_grip.setVisible(False)
+
+        style_file_dialog(filedialog)
+
+        filedialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        filedialog.fileSelected.connect(self.save_file)
+        filedialog.show()
+
+    def open_file(self, filename):
+        """
+        A function to open a pulse list
+        :param filename: string
+        """
+        # Block loading a preset while an experiment is running: it would
+        # overwrite the GUI and leak digitizer/field commands into the running
+        # experiment's command pipe. Only valid when idle or previewing
+        # (Run Pulses).
+        if self.is_experiment:
+            self.message('Cannot load a preset while an experiment is running.')
+            return
+
+        self.path = os.path.dirname(filename)
+        ldir.save('phase', self.path)
+        self.opened = 1
+
+        self.reset_links()
+
+        text = open(filename).read()
+        lines = text.split('\n')
+
+        for line in lines:
+            if line.startswith('Auto window:'):
+                try:
+                    self.Win_width.setValue( float( line.split(':  ')[1] ) )
+                except (IndexError, ValueError):
+                    pass
+                break
+
+        try:
+            self.P_to_drop.setValue( int( lines[16].split(':  ')[1] ) )
+            self.Zero_order.setValue( float( lines[17].split(':  ')[1] ) )
+            self.First_order.setValue( float( lines[18].split(':  ')[1] ) )
+            self.Second_order.setValue( float( lines[19].split(':  ')[1] ) )
+            self.Combo_laser.setCurrentText( str( lines[20].split(':  ')[1] ) )
+
+        except IndexError:
+            pass
+        self.setter(text, 0, self.P1_type, self.P1_st, self.P1_len, self.Phase_1, self.P1_st_inc, self.P1_len_inc)
+        self.setter(text, 1, self.P2_type, self.P2_st, self.P2_len, self.Phase_2, self.P2_st_inc, self.P2_len_inc)
+        self.setter(text, 2, self.P3_type, self.P3_st, self.P3_len, self.Phase_3, self.P3_st_inc, self.P3_len_inc)
+        self.setter(text, 3, self.P4_type, self.P4_st, self.P4_len, self.Phase_4, self.P4_st_inc, self.P4_len_inc)
+        self.setter(text, 4, self.P5_type, self.P5_st, self.P5_len, self.Phase_5, self.P5_st_inc, self.P5_len_inc)
+        self.setter(text, 5, self.P6_type, self.P6_st, self.P6_len, self.Phase_6, self.P6_st_inc, self.P6_len_inc)
+        self.setter(text, 6, self.P7_type, self.P7_st, self.P7_len, self.Phase_7, self.P7_st_inc, self.P7_len_inc)
+        self.setter(text, 7, self.P8_type, self.P8_st, self.P8_len, self.Phase_8, self.P8_st_inc, self.P8_len_inc)
+        self.setter(text, 8, self.P9_type, self.P9_st, self.P9_len, self.Phase_9, self.P9_st_inc, self.P9_len_inc)
+
+        self.Rep_rate.setValue( float( lines[9].split(':  ')[1] ) )
+        self.Field.setValue( float( lines[10].split(':  ')[1] ) )
+
+        #self.live_mode.setCheckState(Qt.CheckState.Unchecked)
+        #self.fft_box.setCheckState(Qt.CheckState.Unchecked)
+        #self.Quad_cor.setCheckState(Qt.CheckState.Unchecked)
+        self.Win_left.setValue( round(float( lines[13].split(':  ')[1] ), 1) )
+        self.Win_right.setValue( round(float( lines[14].split(':  ')[1] ), 1) )
+        self.Acq_number.setValue( int( lines[15].split(':  ')[1] ) )
+        self.Dec.setValue( int( lines[21].split(':  ')[1] ) )
+
+        self.box_points.setValue( int( lines[22].split(':  ')[1] ) )
+        self.box_scan.setValue( int( lines[23].split(':  ')[1] ) )
+        self.Log_start.setValue( float( lines[24].split(':  ')[1] ) )
+        self.Log_end.setValue( float( lines[25].split(':  ')[1] ) )
+        self.box_st_field.setValue( float( lines[26].split(':  ')[1] ) )
+        self.box_end_field.setValue( float( lines[27].split(':  ')[1] ) )
+        self.box_step_field.setValue( float( lines[28].split(':  ')[1] ) )
+        self.combo_sweep.setCurrentText( str( lines[29].split(':  ')[1] ) )
+
+        try:
+            self.X0.setValue( float( lines[30].split(':  ')[1] ) )
+            self.XDelta.setValue( float( lines[31].split(':  ')[1] ) )
+        except IndexError:
+            pass
+
+        self.dig_stop()
+
+        self.fft = 0
+        self.quad = 0
+        self.opened = 0
+
+        # A freshly loaded preset no longer matches whatever sequence a
+        # preview is still running (the dig_stop above is a no-op while
+        # opened == 1). If Run Pulses is active, stop it now so the operator
+        # restarts cleanly with Run Pulses on the loaded sequence.
+        if self._live_run_alive():
+            self.dig_stop()
+
+    def setter(self, text, index, typ, st, leng, phase, d_start, len_inc):
+        """
+        Auxiliary function to set all the values from *.pulse file
+        """
+        array = text.split('\n')[index].split(':  ')[1].split(',  ')
+
+        typ.setCurrentText( array[0] )
+        st.setValue( float( array[1] ) )
+        leng.setValue( float( array[2] ) )
+        phase.setPlainText( str( (array[3])[1:-1] ) )
+        d_start.setValue( float( array[4] ) )
+        len_inc.setValue( float( array[5] ) )
+
+    def apply_seqcalc_pulses(self, filename):
+        """Apply ONLY the pulse layout from a Sequence-Calculator preset.
+
+        Unlike ``open_file`` (which restores a whole experiment), this leaves
+        every tuned acquisition parameter alone — field, rep rate, detection
+        window, decimation, scans, sweep type, etc. It is what the calculator's
+        "Open in RECT" pushes into an already-open, already-tuned window, so a
+        delay/phase tweak never clobbers the setup.
+
+        Per pulse it sets the start position and the phase. P1 is the detection
+        pulse: its start is the detection position and its phase is the receiver.
+        The number of pulses follows the preset (a pulse is "used" when its
+        length field is non-zero). Lengths, types and increments the operator
+        already tuned are preserved; we assign them only for a pulse the preset
+        newly switches on (currently length 0), and we switch a pulse off
+        (length 0) when the new sequence no longer uses it.
+        """
+        # Same pipe-leak risk as open_file: block while an experiment runs.
+        if self.is_experiment:
+            self.message('Cannot apply pulses while an experiment is running.')
+            return
+
+        self.opened = 1
+
+        self.reset_links()
+
+        lines = open(filename).read().split('\n')
+        for i in range(1, 10):
+            try:
+                array = lines[i - 1].split(':  ')[1].split(',  ')
+            except IndexError:
+                continue
+            preset_len = float( array[2] )
+            used = (i == 1) or (preset_len != 0.0)
+            st_box = getattr(self, f'P{i}_st')
+            len_box = getattr(self, f'P{i}_len')
+            if used:
+                st_box.setValue( float( array[1] ) )
+                getattr(self, f'Phase_{i}').setPlainText( str( array[3][1:-1] ) )
+                if len_box.value() == 0.0:          # pulse newly switched on
+                    getattr(self, f'P{i}_type').setCurrentText( array[0] )
+                    len_box.setValue( preset_len )
+            else:
+                len_box.setValue( 0.0 )             # drop a now-unused pulse
+        self.dig_stop()
+        self.fft = 0
+        self.quad = 0
+        self.opened = 0
+
+        # If Run Pulses is active, stop the running preview so the loaded layout
+        # is applied cleanly on the next Run Pulses (see open_file).
+        if self._live_run_alive():
+            self.dig_stop()
+
+    ###
+    def save_file(self, filename):
+        """
+        A function to save a new pulse list
+        :param filename: string
+        """
+        self.path = os.path.dirname(filename)
+        ldir.save('phase', self.path)
+        if filename[-5:] != 'phase':
+            filename = filename + '.phase'
+        with open(filename, 'w') as file:
+            for i in range(1, 10):
+
+                p_type = getattr(self, f'P{i}_type').currentText()
+                p_st = getattr(self, f'P{i}_st').value()
+                p_len = getattr(self, f'P{i}_len').value()
+                #ph_list = getattr(self, f'ph_{i}')
+                ph_list = getattr(self, f'Phase_{i}').toPlainText().strip()
+                d_start = getattr(self, f'P{i}_st_inc').value()
+                len_inc = getattr(self, f'P{i}_len_inc').value()
+                
+                ph_str = f"[{ph_list}]"#f"[{','.join(ph_list)}]"
+                file.write(f"P{i}:  {p_type},  {p_st},  {p_len},  {ph_str},  {d_start},  {len_inc}\n")
+
+            file.write( 'Rep rate:  ' + str(self.Rep_rate.value()) + '\n' )
+            file.write( 'Field:  ' + str(self.Field.value()) + '\n' )
+            file.write( 'Points:  ' + str(2016) + '\n' )
+            file.write( 'Horizontal offset:  ' + str( 1024 ) + '\n' )
+            file.write( 'Window left:  ' + str(self.Win_left.value()) + '\n' )
+            file.write( 'Window right:  ' + str(self.Win_right.value()) + '\n' )
+            file.write( 'Acquisitions:  ' + str(self.Acq_number.value()) + '\n' )
+            file.write( 'Points to Drop:  ' + str(self.P_to_drop.value()) + '\n' )
+            file.write( 'Zero order:  ' + str(self.Zero_order.value()) + '\n' )
+            file.write( 'First order:  ' + str(self.First_order.value()) + '\n' )
+            file.write( 'Second order:  ' + str(self.Second_order.value()) + '\n' )
+            file.write( 'Laser:  ' + str( self.Combo_laser.currentText() ) + '\n' )
+            file.write( 'Decimation:  ' + str( self.Dec.value() ) + '\n' )
+
+            file.write( 'Points:  ' + str( self.box_points.value() ) + '\n' )
+            file.write( 'Scans:  ' + str( self.box_scan.value() ) + '\n' )
+            file.write( 'Log Start:  ' + str( self.Log_start.value() ) + '\n' )
+            file.write( 'Log End:  ' + str( self.Log_end.value() ) + '\n' )
+            file.write( 'Start Field:  ' + str( self.box_st_field.value() ) + '\n' )
+            file.write( 'End Field:  ' + str( self.box_end_field.value() ) + '\n' )
+            file.write( 'Field Step:  ' + str( self.box_step_field.value() ) + '\n' )
+            file.write( 'Sweep Type:  ' + self.combo_sweep.currentText() + '\n' )
+
+            file.write( 'X0:  ' + str( self.X0.value() ) + '\n' )
+            file.write( 'dX:  ' + str( self.XDelta.value() ) + '\n' )
+            file.write( 'Auto window:  ' + str( self.Win_width.value() ) + '\n' )
+
+    def phase_converted(self, ph_str):
+        if ph_str == '+x':
+            return '+x'
+        elif ph_str == '-x':
+            return '-x'
+        elif ph_str == '+y':
+            return '+y'
+        elif ph_str == '-y':
+            return '-y'
+
+    ###
+    def update_pulse_phase(self, index):
+        
+        #text_edit = getattr(self, f"Phase_{index}")
+        #temp = text_edit.toPlainText().strip()
+
+        try:
+            active_phases = []
+            num_pulses = []
+            for i in range(1, 10):
+                attr_name = f"ph_{i}"
+                p_len = getattr(self, f"P{i}_len").value()
+
+                if not hasattr(self, attr_name) or p_len != 0.0:
+                    phase_text = getattr(self, f"Phase_{i}").toPlainText().strip()
+                    if p_len != 0.0 and not self._is_laser_row(i):
+                        active_phases.append(phase_text)
+                        num_pulses.append(i)
+                    setattr(self, attr_name, phase_text)
+
+            a = self.expand_phase_cycling(*active_phases)
+            setattr(self, "ph_1", a['receiver'])
+            
+            for i, pulse_phase in enumerate(a['pulses']):
+                setattr(self, f"ph_{num_pulses[i+1]}", pulse_phase)
+
+
+            #if len(temp) >= 2: #and temp[0] == '[' and temp[-1] == ']':
+            #    content = temp[:].split(',') #[1:-1]
+            #    phases = [p.strip() for p in content if p.strip()]
+
+            #    if len(phases) == 1:
+            #        phases.append(phases[0])
+
+            #    setattr(self, f"ph_{index}", phases)
+
+        except (IndexError, AttributeError, Exception) as e:
+            pass
+
+        # The phase cycle is not live-editable (it changes the number of phases /
+        # the GIM buffer layout). Route it through the debounced path so the edit
+        # auto-restarts (announced) instead of silently waiting for Run Pulses.
+        self.schedule_live_apply()
+
+    def remove_ns(self, string1):
+        return string1.split(' ')[0]
+
+    def add_ns(self, string1):
+        """
+        Function to add ' ns'
+        """
+        return str( string1 ) + ' ns'
+
+    def check_length(self, length):
+        self.errors.clear()
+
+        if int( length ) != 0 and int( length ) < 12:
+            self.errors.appendPlainText( 'Pulse should be longer than 12 ns' )
+
+        return length
+
+    def round_to_closest(self, x, y):
+        """
+        A function to round x to divisible by y
+        """
+        return round(( y * ( ( x // y ) + (round(x % y, 2) > 0) ) ), 1)
+
+    def round_and_change(self, doubleBox):
+        """
+        """
+        raw = doubleBox.value()
+        current = self.round_to_closest( raw, 3.2 )
+        if current != raw:
+            doubleBox.setValue( current )
+        return self.add_ns( doubleBox.value() )
+
+    def round_and_change_no_ns(self, doubleBox):
+        """
+        """
+        raw = doubleBox.value()
+        current = self.round_to_closest( raw, 3.2 )
+        if current != raw:
+            doubleBox.setValue( current )
+        return doubleBox.value()
+
+    def decimat(self):
+        """
+        A function to set decimation coefficient
+        """
+        current = self.Dec.value()
+        
+        if current == 3:
+            new_val = 4 if self.decimation == 2 else 2
+            self.Dec.blockSignals(True)
+            self.Dec.setValue(new_val)
+            self.Dec.blockSignals(False)
+            self.decimation = new_val
+        else:
+            self.decimation = current
+
+        self.time_per_point = 0.4 * self.decimation
+
+        # Decimation is fixed at pulser_open, so a live change can only be honored
+        # by a full restart -- route it through the same debounced path, which
+        # detects the structural change and restarts.
+        self.schedule_live_apply()
+
+    ###
+    def update_pulse_param(self, index, attr_suffix, val_suffix):
+        spin_widget = getattr(self, f"P{index}{attr_suffix}")
+        new_value = self.round_and_change(spin_widget)
+        setattr(self, f"p{index}{val_suffix}", new_value)
+
+        if attr_suffix == "_len":
+            self.update_pulse_phase(1)
+        #print(f"Updated: p{index}{val_suffix} = {new_value}")
+
+        # Start / Length are the live-editable fields; schedule a debounced re-arm.
+        if attr_suffix in ("_st", "_len"):
+            self.schedule_live_apply()
+
+    # ---- Live Edit helpers ----
+    def live_edit_toggle(self):
+        self.live_edit_on = 1 if self.live_edit_box.isChecked() else 0
+
+    def _live_run_alive(self):
+        """A dig_on preview is running (not a long experiment) and reachable."""
+        if getattr(self, 'is_experiment', False):
+            return False
+        proc = getattr(self, 'digitizer_process', None)
+        try:
+            return proc is not None and proc.is_alive()
+        except (AttributeError, ValueError):
+            return False
+
+    def _live_snapshot(self):
+        """Current pulse table as [[typ, start, length, phase_list], ...] for P1..P9."""
+        snap = []
+        for i in range(1, 10):
+            snap.append([
+                getattr(self, f'p{i}_typ'),
+                getattr(self, f'p{i}_start'),
+                getattr(self, f'p{i}_length'),
+                getattr(self, f'ph_{i}'),
+            ])
+        return snap
+
+    def _structure_sig(self, snap):
+        """
+        Signature of everything that is NOT live-editable (only Start / Length
+        are): the count of active (non-zero-length) pulses, the phase-cycle
+        length, decimation, and the per-pulse channel/type (so a DETECTION/MW/
+        LASER change forces a restart rather than a partial live apply). A change
+        here cannot be re-armed live.
+        """
+        active = [p for p in snap if int(float(str(p[2]).split(' ')[0])) != 0]
+        phases = len(snap[0][3]) if snap and snap[0][3] is not None else 0
+        # Hash every active pulse's phase text, not just the receiver step count:
+        # phases are not in the live 'PU' payload, so ANY phase-cycle edit (a
+        # content change that keeps the same number of steps, or a step-count
+        # change) must fall back to the announced restart instead of being
+        # silently dropped.
+        phase_sig = self._phase_sig()
+        types = tuple(p[0] for p in active)
+        # The DETECTION pulse length sets adc_window, which is baked into the
+        # stream buffer / WIN_ADC / x_axis / data_raw at pulser_open -- it cannot
+        # be re-armed live, so a detection-window change belongs in the signature
+        # and forces a restart.
+        det_len = tuple(str(p[2]) for p in snap if p[0] == 'DETECTION')
+        laser = tuple((str(p[1]), str(p[2])) for p in snap[1:1 + self.laser_flag])
+        return (len(active), phases, phase_sig, self.decimation, types, det_len,
+                self.laser_flag, getattr(self, 'combo_laser_num', 0), laser)
+
+    def _phase_sig(self):
+        """Normalized phase text of every active (non-zero-length) pulse, keyed by
+        index. Any edit to a phase box changes this, forcing a live-edit restart
+        (phases can only be applied by rebuilding, never via the 'PU' payload)."""
+        out = []
+        for i in range(1, 10):
+            if self._is_laser_row(i):
+                continue
+            try:
+                if float(str(getattr(self, f'p{i}_length')).split(' ')[0]) == 0:
+                    continue
+            except (ValueError, AttributeError):
+                continue
+            box = getattr(self, f'Phase_{i}', None)
+            if box is not None:
+                out.append((i, box.toPlainText().strip().lower().replace(' ', '')))
+        return tuple(out)
+
+    def _validate_live_edit(self):
+        """
+        Reject-and-keep-running pre-check for a live edit: return an error string
+        if the proposed pulse table is invalid, else None. expand_phase_cycling
+        silently LCM-reconciles lengths and coerces unknown tokens to '+x', so a
+        cycle typo or an overlap would otherwise slip straight to the card. On a
+        non-None return live_apply neither pushes 'PU' nor restarts -- the running
+        preview is left untouched and the error is shown.
+
+        Checks: (1) every phase token in a plain comma list is recognized;
+        (2) all *cycled* (>=2-step) plain lists share one length (a length-1 list
+        is a non-cycling fixed phase and is exempt; bracket/paren notation is an
+        intentional Kronecker expansion and is skipped); (3) no two MW pulses
+        overlap in time (DETECTION/LASER may legitimately overlap MW).
+        """
+        valid = {'+x', '-x', '+y', '-y', 'x', 'y', 'i', '-i', '+', '-', '0'}
+        coeff = re.compile(r'[+-]?\d+\.?\d*')
+        simple_lens = []          # (i, nsteps) for plain cycled lists
+        mw_windows = []           # (i, start, end) for MW pulses
+        receiver = None
+        for i in range(1, 10):
+            length = float(str(getattr(self, f'p{i}_length')).split(' ')[0])
+            if length == 0:
+                continue
+            if receiver is None:
+                receiver = i
+            if self._is_laser_row(i):
+                continue
+            raw = getattr(self, f'Phase_{i}').toPlainText().strip()
+            if '[' in raw or '(' in raw:
+                pass
+            elif i == receiver and not any(c in raw.lower() for c in 'xy'):
+                # coherence-order coefficients, one per pulse, not a phase list
+                for t in raw.split(','):
+                    t = t.strip()
+                    if t and coeff.fullmatch(t) is None:
+                        return f'unrecognized receiver coefficient "{t}" in pulse P{i}.'
+            else:
+                toks = [t.strip().lower().replace(' ', '')
+                        for t in raw.split(',') if t.strip()]
+                for t in toks:
+                    if t not in valid:
+                        return f'unrecognized phase "{t}" in pulse P{i}.'
+                if len(toks) >= 2:
+                    simple_lens.append((i, len(toks)))
+            if getattr(self, f'p{i}_typ') == 'MW':
+                start = float(str(getattr(self, f'p{i}_start')).split(' ')[0])
+                mw_windows.append((i, start, start + length))
+
+        if simple_lens:
+            i0, L0 = simple_lens[0]
+            for i, L in simple_lens[1:]:
+                if L != L0:
+                    return (f'phase-cycle length mismatch: P{i} has {L} steps but '
+                            f'P{i0} has {L0} (receiver and every cycled pulse must '
+                            f'share one length).')
+
+        mw_windows.sort(key=lambda w: w[1])
+        for a, b in zip(mw_windows, mw_windows[1:]):
+            if b[1] < a[2] - 0.05:
+                return f'MW pulses P{a[0]} and P{b[0]} overlap in time.'
+        return None
+
+    def schedule_live_apply(self):
+        """(Re)start the debounce timer when live edit is armed and a preview runs.
+        Defensive getattr: this is invoked from update_pulse_phase() during widget
+        construction, before live_edit_on / opened are set."""
+        if (getattr(self, 'live_edit_on', 0) and getattr(self, 'opened', 1) == 0
+                and self._live_run_alive()):
+            self.live_timer.start(int(self.Debounce.value()))
+
+    def live_apply(self):
+        """
+        Debounce fired: push the current pulse table into the running worker.
+        Geometry-preserving edits go over the pipe as a 'PU' snapshot; a
+        structural change transparently restarts the card with a notice; an
+        invalid edit is rejected and the running preview is left untouched.
+        """
+        if not (self.live_edit_on and self.opened == 0 and self._live_run_alive()):
+            return
+
+        err = self._validate_live_edit()
+        if err is not None:
+            self.errors.appendPlainText(
+                'Live Edit rejected — ' + err
+                + ' Preview left running; fix the value.')
+            return
+
+        if self.l_mode == 1:
+            # Accumulation mode: the driver's running average is never
+            # cleared, so an in-place re-arm would mix old- and new-parameter
+            # shots into one buffer — restart for a fresh accumulation.
+            self.update()
+            self.errors.appendPlainText(
+                'Live Edit: Accumulation Mode is on — the accumulated average '
+                'cannot be re-armed in place; full restart performed.')
+            return
+
+        snap = self._live_snapshot()
+        if self._structure_sig(snap) != self.live_sig:
+            # update() tears down the worker via dig_stop(), whose
+            # check_process_status() clears the log -- so announce the restart
+            # AFTER it, or the label is wiped microseconds after it is written and
+            # never seen. The new preview then appends its pulse list below.
+            self.update()
+            self.errors.appendPlainText(
+                'Live Edit: rebuild-only parameter changed (channel/type / laser / '
+                'phase cycle / pulse count / decimation / detection window) — full '
+                'restart performed.')
+            return
+
+        try:
+            self.parent_conn_dig.send('PU' + json.dumps(snap))
+        except (AttributeError, BrokenPipeError, OSError):
+            pass
+
+    def update_pulse_type(self, index):
+
+        combo = getattr(self, f"P{index}_type")
+        text = combo.currentText()
+        
+        setattr(self, f"p{index}_typ", text)
+
+        if index in (2, 3):
+            p3 = getattr(self, 'P3_type', None)
+            if index == 3 and text == 'LASER' and self.P2_type.currentText() != 'LASER':
+                if hasattr(self, 'errors'):
+                    self.errors.appendPlainText('P3 can be LASER only when P2 is LASER')
+                combo.setCurrentText('MW')
+                return
+            if index == 2 and text != 'LASER' and p3 is not None and p3.currentText() == 'LASER':
+                p3.setCurrentText('MW')
+            p2_laser = self.P2_type.currentText() == 'LASER'
+            p3_laser = p3 is not None and p3.currentText() == 'LASER'
+            self.laser_flag = (2 if p3_laser else 1) if p2_laser else 0
+
+            is_laser = text == 'LASER'
+            getattr(self, f"P{index}_len").setMaximum(self.laser_len_max if is_laser else self.mw_len_max)
+            phase_box = getattr(self, f"Phase_{index}", None)
+            if phase_box is not None:
+                phase_box.setEnabled(not is_laser)
+                self.update_pulse_phase(1)
+            self._raise_laser_len_ndyag()
+
+        #print(f"Pulse {index} type set to: {text}")
+        # Channel/type is not live-editable; schedule the debounced path so the
+        # change auto-restarts (announced) instead of silently waiting for Run
+        # Pulses.
+        self.schedule_live_apply()
+
+    def _is_laser_row(self, i):
+        """Laser rows are the leading LASER rows from P2."""
+        return 2 <= i <= 1 + self.laser_flag
+
+    def rep_rate(self):
+        """
+        A function to change a repetition rate
+        """
+        self.repetition_rate = str( self.Rep_rate.value() ) + ' Hz'
+
+        if self.laser_flag == 0:
+            pass
+        elif self.laser_flag >= 1 and self.combo_laser_num == 1:
+            self.repetition_rate = '9.9 Hz'
+            ###self.pb.pulser_repetition_rate( self.repetition_rate )
+            self.Rep_rate.setValue(9.9)
+            self.errors.appendPlainText( '9.9 Hz is the fixed repetition rate for Nd:YAG' )
+        elif self.laser_flag >= 1 and self.combo_laser_num == 2:
+            pass
+
+        self._update_rep_time_display()
+
+        try:
+            self.parent_conn_dig.send( 'RR' + str( self.repetition_rate.split(' ')[0] ) )
+        except AttributeError:
+            pass
+
+    def _update_rep_time_display(self):
+        rate_hz = float( self.Rep_rate.value() )
+        if rate_hz <= 0:
+            self.Rep_rate.setSuffix(" Hz")
+            return
+        t_s = 1.0 / rate_hz
+        if   t_s >= 1.0:   val, unit = t_s,       "s"
+        elif t_s >= 1e-3:  val, unit = t_s * 1e3, "ms"
+        elif t_s >= 1e-6:  val, unit = t_s * 1e6, "µs"
+        else:              val, unit = t_s * 1e9, "ns"
+        self.Rep_rate.setSuffix(f" Hz | {val:.1f} {unit}")
+
+    def field(self):
+        """
+        A function to change a magnetic field
+        """
+        self.mag_field = float( self.Field.value() )
+        ###self.bh15.magnet_field( self.mag_field )
+        try:
+            #self.errors.appendPlainText( str( self.mag_field ) )
+            self.parent_conn_dig.send( 'FI' + str( self.mag_field ) )
+        except AttributeError:
+            pass
+
+    def update(self):
+        """
+        A function to run pulses
+        """
+        if self.is_experiment == True:
+            return
+
+        self.dig_stop()
+        self.dig_start()
+
+    def dig_stop(self):
+        """
+        A function to stop digitizer
+        """
+        self.button_track.setEnabled(False)
+        self.stop_requested = True
+        path_to_main = os.path.abspath( os.getcwd() )
+        path_file = os.path.join(path_to_main, '../atomize/control_center/digitizer_insys.param')
+        #path_file = os.path.join(path_to_main, 'digitizer_insys.param')
+
+        file_to_read = open(path_file, 'w')
+        file_to_read.write('Points: ' + str( self.p1_length ) +'\n')
+        file_to_read.write('Sample Rate: ' + str( 2500 ) +'\n')
+        file_to_read.write('Posstriger: ' + str( 1024 ) +'\n')
+        file_to_read.write('Range: ' + str( 200 ) +'\n')
+        file_to_read.write('CH0 Offset: ' + str( 0 ) +'\n')
+        file_to_read.write('CH1 Offset: ' + str( 0 ) +'\n')
+
+        if self.cur_win_right < self.cur_win_left:
+            self.cur_win_left, self.cur_win_right = self.cur_win_right, self.cur_win_left
+        if self.cur_win_right == self.cur_win_left:
+            self.cur_win_right += 1 #self.time_per_point
+
+        file_to_read.write('Window Left: ' + str( int(self.cur_win_left) ) +'\n') #/ self.time_per_point
+        file_to_read.write('Window Right: ' + str( int(self.cur_win_right ) ) +'\n') #/ self.time_per_point
+        file_to_read.write('Decimation: ' + str( self.decimation ) +'\n')
+        # zero order for acquisition scripts; first/second order are FFT-view only
+        file_to_read.write('Zero order: ' + str( getattr(self, 'zero_order', 0.0) ) +'\n')
+        file_to_read.write('First order: 0.0\n')
+        file_to_read.write('Second order: 0.0\n')
+
+        file_to_read.close()
+
+        if self.opened == 0:
+            try:
+                self.parent_conn_dig.send('exit')
+                # Pulse mode (Run Pulses): tear down synchronously so update() /
+                # start_exp() can restart immediately on the *next* line -- by the
+                # time dig_start()/dig_start_exp() runs, the old worker is dead, so
+                # its is_alive() guard passes and the intermediate button style is
+                # overwritten in the same callback (no visible flash). The
+                # digitizer stall-watchdog bounds this join, and the worker's
+                # finally runs pulser_close(), so the GUI can't freeze and strand
+                # the card. Experiment mode (long acquisitions) stays non-blocking
+                # via monitor_timer.
+                if self.is_experiment == False:
+                    self.digitizer_process.join()
+                    self.check_process_status()
+                else:
+                    self.monitor_timer.start(200)
+
+            except (AttributeError, BrokenPipeError, OSError):
+                if self.exit_clicked == 1:
+                    sys.exit()
+
+    def dig_start_exp(self):
+        worker = Worker()
+
+        for i in range(1, 10):
+            data = [
+                getattr(self, f'p{i}_typ'),
+                getattr(self, f'p{i}_start'),
+                getattr(self, f'p{i}_length'),
+                getattr(self, f'ph_{i}'),
+                getattr(self, f'p{i}_st_increment'),
+                getattr(self, f'p{i}_len_increment')
+            ]
+            setattr(self, f'p{i}_exp', data)
+
+        if self.laser_flag >= 1:
+            if self.combo_laser_num == 1:
+                self.Rep_rate.setValue(9.9)
+            elif self.combo_laser_num == 2:
+                pass
+
+        # prevent running two processes
+        try:
+            if ( self.digitizer_process.is_alive() == True ):
+                return
+        except AttributeError:
+            pass
+
+        self.stop_requested = False
+        self.parent_conn_dig, self.child_conn_dig = Pipe()
+        # a process for running function script 
+        # sending parameters for initial initialization
+
+        if self.cur_sweep == 'Linear Time':
+            self.digitizer_process = Process( target = worker.exp, args = (
+                self.child_conn_dig,
+                self.decimation, self.number_averages, self.cur_scan, self.cur_points,
+                self.cur_win_left, self.cur_exp_name, self.cur_curve_name,
+                self.cur_win_right, self.p1_exp, self.p2_exp, self.p3_exp, self.p4_exp,
+                self.p5_exp, self.p6_exp, self.p7_exp, self.p8_exp, self.p9_exp, self.laser_flag,
+                self.repetition_rate.split(' ')[0],
+                self.mag_field, self.combo_laser_num, self.laser_q_switch_delay,
+                self.cur_x0, self.cur_xdelta,
+                self.zero_order, self.first_order, self.second_order, self.quad, True
+                )
+            )
+        elif self.cur_sweep == 'Field':
+            self.digitizer_process = Process( target = worker.exp_field, args = (
+                self.child_conn_dig,
+                self.decimation, self.number_averages, self.cur_scan, self.cur_start_field,
+                self.cur_end_field, self.cur_step,
+                self.cur_win_left, self.cur_exp_name, self.cur_curve_name,
+                self.cur_win_right, self.p1_exp, self.p2_exp, self.p3_exp, self.p4_exp,
+                self.p5_exp, self.p6_exp, self.p7_exp, self.p8_exp, self.p9_exp, self.laser_flag,
+                self.repetition_rate.split(' ')[0],
+                self.combo_laser_num, self.laser_q_switch_delay,
+                self.zero_order, self.first_order, self.second_order, self.quad, True
+                )
+            )
+        elif self.cur_sweep == 'Log Time':
+            self.digitizer_process = Process( target = worker.exp_log, args = (
+                self.child_conn_dig,
+                self.decimation, self.number_averages, self.cur_scan, self.cur_points,
+                self.cur_log_start, self.cur_log_end,
+                self.cur_win_left, self.cur_exp_name, self.cur_curve_name,
+                self.cur_win_right, self.p1_exp, self.p2_exp, self.p3_exp, self.p4_exp,
+                self.p5_exp, self.p6_exp, self.p7_exp, self.p8_exp, self.p9_exp, self.laser_flag,
+                self.repetition_rate.split(' ')[0], self.mag_field,
+                self.combo_laser_num, self.laser_q_switch_delay,
+                self.cur_x0, self.cur_xdelta,
+                self.zero_order, self.first_order, self.second_order, self.quad, True
+                )
+            )
+
+        self.button_start_exp.setStyleSheet(REFINED_STYLES['ACTIVE_BUTTON_STYLE'])
+
+        self.digitizer_process.start()
+        # send a command in a different thread about the current state
+        self.parent_conn_dig.send('start')
+        ###
+        self.last_error = False
+        ###
+        self.is_testing = True
+        self.is_experiment = True
+        field_param.set_lock('phasing_insys')
+        temp_param.set_lock('phasing_insys')
+        self.timer.start(200)
+
+    def dig_start(self):
+        """
+        Button Start; Run function script(pipe_addres, four parameters of the experimental script)
+        from Worker class in a different thread
+        Create a Pipe for interaction with this thread
+        self.param_i are used as parameters for script function
+        """
+        worker = Worker()
+
+        for i in range(1, 10):
+            data = [
+                getattr(self, f'p{i}_typ'),
+                getattr(self, f'p{i}_start'),
+                getattr(self, f'p{i}_length'),
+                getattr(self, f'ph_{i}')
+            ]
+            setattr(self, f'p{i}_list', data)
+
+        # Baseline the structure this preview is opened with, so later live edits
+        # can tell a re-armable change from one that needs a restart.
+        self.live_sig = self._structure_sig(self._live_snapshot())
+
+        if self.laser_flag >= 1:
+            if self.combo_laser_num == 1:
+                self.Rep_rate.setValue(9.9)
+            elif self.combo_laser_num == 2:
+                pass
+
+        # prevent running two processes
+        try:
+            if self.digitizer_process.is_alive() == True:
+                return
+        except AttributeError:
+            pass
+
+        self.stop_requested = False
+        self.parent_conn_dig, self.child_conn_dig = Pipe()
+        # a process for running function script 
+        # sending parameters for initial initialization
+        self.digitizer_process = Process( target = worker.dig_on, args = ( self.child_conn_dig,
+            self.decimation, self.l_mode, self.number_averages, self.cur_win_left,
+            self.cur_win_right, self.p1_list, self.p2_list, self.p3_list, self.p4_list,
+            self.p5_list, self.p6_list, self.p7_list, self.laser_flag,
+            self.repetition_rate.split(' ')[0],
+            self.mag_field, self.fft, self.quad, self.zero_order, self.first_order,
+            self.second_order, self.p_to_drop, self.combo_laser_num, self.laser_q_switch_delay,
+            self.p8_list, self.p9_list, True ) )
+
+        self.button_update.setStyleSheet(REFINED_STYLES['ACTIVE_BUTTON_STYLE'])
+
+        #self.progress_bar.setValue(0)
+
+        self.digitizer_process.start()
+        # send a command in a different thread about the current state
+        self.parent_conn_dig.send('start')
+        ###
+        self.last_error = False
+        ###
+        self.is_testing = True
+        self.timer.start(200)
+
+    def turn_off(self):
+        """
+        A function to turn off a programm.
+        """
+        self.exit_clicked = 1
+        self.stop_requested = True
+        self.dig_stop()
+
+    def message(self, *text):
+        if len(text) == 1:
+            print(f'{text[0]}', flush=True)
+        else:
+            print(f'{text}', flush=True)
+
+    def button_blue(self):
+        self.button_update.setStyleSheet(REFINED_STYLES['BUTTON_STYLE'])
+        self.button_start_exp.setStyleSheet(REFINED_STYLES['BUTTON_STYLE'])
+
+    def parse_message(self):
+        msg_type, data = self.parent_conn_dig.recv()
+
+        if msg_type == 'Status':
+            self.progress_bar.setValue(int(data))
+        elif msg_type == 'Open':
+            self.open_dialog()
+        elif msg_type == 'Message':
+            self.errors.appendPlainText(data)
+        elif msg_type == 'Error':
+            self.button_track.setEnabled(False)
+            self.message_panel.set_experiment_running(False)
+            self.last_error = True
+            self.timer.stop()
+            self.is_experiment = False
+            self.progress_bar.setValue(0)
+            self.message(data)
+            self.errors.appendPlainText(data)
+            self.button_blue()    
+        elif msg_type == 'Average':
+            self.Acq_number.setValue(int(data))
+        elif msg_type == 'Count':
+            self.update_count_nip(data)
+        elif msg_type == 'PulseList':
+            self.update_pulse_list_display(data)
+        elif msg_type == 'AutoWindow':
+            left_ns, right_ns, peak_ns = data
+            self.Win_left.setValue(round(left_ns, 1))
+            self.Win_right.setValue(round(right_ns, 1))
+            self.errors.appendPlainText(f'Auto window: {left_ns:.1f} to {right_ns:.1f} ns, peak at {peak_ns:.1f} ns')
+        elif msg_type == 'AutoPhase':
+            if self.Quad_cor.isChecked():
+                return
+            phase_deg, magnitude = data
+            self.Zero_order.setValue(round(phase_deg, 4))
+            self.errors.appendPlainText(f'Auto phase: Zero Order = {phase_deg:.1f} deg, |I+iQ| = {magnitude:.1f}')
+        elif msg_type == 'LiveReject':
+            # The worker's test-mode Insys rebuild found the live edit invalid
+            # (e.g. an overlap the AMP_ON/LNA_PROTECT join cannot resolve). The
+            # running preview was left on the previous sequence; surface why.
+            self.errors.appendPlainText('Live Edit rejected — ' + str(data)
+                + ' Preview left running; fix the value.')
+        else:
+            self.timer.stop()
+            if ( data.startswith('Exp') ) and (msg_type == 'test'):
+                pass
+            else:
+                self.errors.appendPlainText(data)
+            if msg_type != 'test':
+                self.message_panel.set_experiment_running(False)
+                self.message(data)
+                self.button_blue()
+                self.progress_bar.setValue(0)
+                if self.monitor_timer.isActive():
+                    pass
+                else:
+                    self.is_experiment = False
+
+    def update_count_nip(self, text):
+        """Refresh the trailing acquisition count without disturbing messages."""
+        self.message_panel.update_count(text)
+
+    def update_pulse_list_display(self, text):
+        """Refresh pulse details without replacing the message history."""
+        self.message_panel.update_pulse_list(text)
+
+    def check_messages(self):
+        self.button_track.setEnabled(self._track_available())
+        if not hasattr(self, 'last_error'):
+            self.last_error = False
+
+        while self.parent_conn_dig.poll():
+            try:
+                self.parse_message()
+            except EOFError:
+                self.timer.stop()
+                break
+            except Exception as e:
+                # never swallow silently: surface the failure in the TextEdit
+                import traceback
+                self.errors.appendPlainText('GUI message-pump error:\n' + traceback.format_exc())
+                break
+
+        if self.digitizer_process.is_alive() and not self.timer.isActive():
+            self.digitizer_process.join()
+
+        if hasattr(self, 'digitizer_process') and not self.digitizer_process.is_alive():
+            self.message_panel.set_experiment_running(False)
+            if self.parent_conn_dig.poll():
+                #return #better to repeat the whole logic
+                self.parse_message()
+
+            self.timer.stop()
+
+            if getattr(self, 'is_testing', False):
+                self.is_testing = False
+                exit_code = getattr(self.digitizer_process, 'exitcode', None)
+                # A clean preflight returns exitcode 0. If it died WITHOUT sending
+                # an 'Error' (hard crash in a ctypes device call, a kill, a non-zero
+                # sys.exit, a hang we just joined) last_error is still False but
+                # exitcode != 0 -- surface that instead of silently starting the run.
+                if self.stop_requested or self.exit_clicked:
+                    self.progress_bar.setValue(0)
+                    self.button_blue()
+                    self.is_experiment = False
+                    self.last_error = False
+                    field_param.clear_lock()
+                    temp_param.clear_lock()
+                elif (not self.last_error) and (exit_code in (0, None)):
+                    self.last_error = False 
+                    time.sleep(0.2)
+                    if self.is_experiment == False:
+                        self.run_main_experiment()
+                    else:
+                        self.run_experiment()
+                else:
+                    if not self.last_error:
+                        self.errors.appendPlainText(
+                            'Preflight process exited abnormally (exitcode ' + str(exit_code) +
+                            ') without reporting an error; experiment not started.')
+                        if hasattr(self, 'progress_bar'):
+                            self.progress_bar.setValue(0)
+                        if hasattr(self, 'button_blue'):
+                            self.button_blue()
+                        self.is_experiment = False
+                    self.last_error = False
+                    field_param.clear_lock()
+                    temp_param.clear_lock()
+            else:
+                field_param.clear_lock()
+                temp_param.clear_lock()
+
+    def check_process_status(self):
+        if self.digitizer_process.is_alive():
+            return
+
+        self.monitor_timer.stop()
+        self.button_track.setEnabled(False)
+        self.message_panel.set_experiment_running(False)
+
+        if self.is_experiment == True:
+            self.digitizer_process.join()
+            self.progress_bar.setValue(0)
+            self.button_start_exp.setStyleSheet(REFINED_STYLES['BUTTON_STYLE'])
+        else:
+            self.errors.clear()
+            self.button_update.setStyleSheet(REFINED_STYLES['BUTTON_STYLE'])
+        
+        #self.timer.stop()
+        self.is_experiment = False
+        field_param.clear_lock()
+        temp_param.clear_lock()
+
+        if self.exit_clicked == 1:
+            sys.exit()
+
+    def open_dialog(self):
+        file_data = self.file_handler.create_file_dialog(multiprocessing = True,
+            directory = ldir.load('phase', self.path))
+
+        if file_data:
+            if file_data != 'None':
+                self.save_file(file_data.split(".csv")[0])
+            self.parent_conn_dig.send( 'FL' + str( file_data ) )
+        else:
+            self.parent_conn_dig.send( 'FL' + '' )
+
+    def run_main_experiment(self):
+
+        worker = Worker()
+        self.parent_conn_dig, self.child_conn_dig = Pipe()
+        
+        self.digitizer_process = Process( target = worker.dig_on, args = ( self.child_conn_dig,
+            self.decimation, self.l_mode, self.number_averages, self.cur_win_left, 
+            self.cur_win_right, self.p1_list, self.p2_list, self.p3_list, self.p4_list, 
+            self.p5_list, self.p6_list, self.p7_list, self.laser_flag, 
+            self.repetition_rate.split(' ')[0], 
+            self.mag_field, self.fft, self.quad, self.zero_order, self.first_order, 
+            self.second_order, self.p_to_drop, self.combo_laser_num, self.laser_q_switch_delay,
+            self.p8_list, self.p9_list ) )
+
+        self.button_update.setStyleSheet(REFINED_STYLES['PRIMARY_BUTTON_STYLE'])
+
+        self.digitizer_process.start()
+        self.parent_conn_dig.send('start')
+        self.timer.start(200)
+
+    def run_experiment(self):
+
+        worker = Worker()
+        self.parent_conn_dig, self.child_conn_dig = Pipe()
+        
+        if self.cur_sweep == 'Linear Time':
+            self.digitizer_process = Process( target = worker.exp, args = ( 
+                self.child_conn_dig,
+                self.decimation, self.number_averages, self.cur_scan, self.cur_points,
+                self.cur_win_left, self.cur_exp_name, self.cur_curve_name,
+                self.cur_win_right, self.p1_exp, self.p2_exp, self.p3_exp, self.p4_exp, 
+                self.p5_exp, self.p6_exp, self.p7_exp, self.p8_exp, self.p9_exp, self.laser_flag, 
+                self.repetition_rate.split(' ')[0], 
+                self.mag_field, self.combo_laser_num, self.laser_q_switch_delay,
+                self.cur_x0, self.cur_xdelta,
+                self.zero_order, self.first_order, self.second_order, self.quad
+                ) 
+            )
+        elif self.cur_sweep == 'Field':
+            self.digitizer_process = Process( target = worker.exp_field, args = ( 
+                self.child_conn_dig,
+                self.decimation, self.number_averages, self.cur_scan, self.cur_start_field,
+                self.cur_end_field, self.cur_step,
+                self.cur_win_left, self.cur_exp_name, self.cur_curve_name,
+                self.cur_win_right, self.p1_exp, self.p2_exp, self.p3_exp, self.p4_exp, 
+                self.p5_exp, self.p6_exp, self.p7_exp, self.p8_exp, self.p9_exp, self.laser_flag, 
+                self.repetition_rate.split(' ')[0], 
+                self.combo_laser_num, self.laser_q_switch_delay,
+                self.zero_order, self.first_order, self.second_order, self.quad
+                ) 
+            )
+        elif self.cur_sweep == 'Log Time':
+            self.digitizer_process = Process( target = worker.exp_log, args = ( 
+                self.child_conn_dig,
+                self.decimation, self.number_averages, self.cur_scan, self.cur_points,
+                self.cur_log_start, self.cur_log_end,
+                self.cur_win_left, self.cur_exp_name, self.cur_curve_name,
+                self.cur_win_right, self.p1_exp, self.p2_exp, self.p3_exp, self.p4_exp, 
+                self.p5_exp, self.p6_exp, self.p7_exp, self.p8_exp, self.p9_exp, self.laser_flag, 
+                self.repetition_rate.split(' ')[0], self.mag_field,
+                self.combo_laser_num, self.laser_q_switch_delay,
+                self.cur_x0, self.cur_xdelta,
+                self.zero_order, self.first_order, self.second_order, self.quad
+                ) 
+            )
+
+        self.button_start_exp.setStyleSheet(REFINED_STYLES['PRIMARY_BUTTON_STYLE'])
+
+        self.digitizer_process.start()
+        self.message_panel.set_experiment_running(True)
+        self.parent_conn_dig.send('start')
+        self.timer.start(200)
+
+    def expand_phase_cycling(self, p_input, *pulse_args):
+        phases = ['+x', '+y', '-x', '-y']
+        norm = {'x':0, 'y':1, '-x':2, '-y':3, '+':0, '-':2, 'i':1, '-i':3, '0':0}
+
+        def parse_to_indices(s):
+            if not s: return [0]
+            if isinstance(s, list):
+                return [phases.index(p.strip()) if p.strip() in phases else norm.get(p.strip().lower().replace(' ', ''), 0) for p in s]
+            
+            s_clean = s.replace(' ', '')
+            if ',' in s_clean:
+                parts = [p for p in s_clean.split(',') if p]
+                return [phases.index(p) if p in phases else norm.get(p.lower(), 0) for p in parts]
+               
+            def get_recursive(st):
+                st = st.replace('D', '').lower().replace(' ', '')
+                if not st: return [0]
+                if '[' not in st and '(' not in st:
+                    return [norm.get(st.strip(), 0)]
+                is_quad = st.startswith('[')
+                inner = get_recursive(st[1:-1])
+                steps, shift = (4, 1) if is_quad else (2, 2)
+                return [(p_idx + step * shift) % 4 for step in range(steps) for p_idx in inner]
+            
+            return get_recursive(s_clean)
+
+        raw_sequences = [parse_to_indices(arg) for arg in pulse_args]
+        
+        target_len = 1
+        for i, seq in enumerate(raw_sequences):
+            arg = pulse_args[i]
+            if isinstance(arg, str) and ('(' in arg or '[' in arg):
+                if len(seq) > 1: target_len *= len(seq)
+        
+        if target_len == 1:
+            for seq in raw_sequences:
+                if len(seq) > 1:
+                    target_len = abs(target_len * len(seq)) // math.gcd(target_len, len(seq))
+        
+        if target_len < 2: target_len = 2
+
+        pulses_final = []
+        current_repeat = 1
+        for i, seq in enumerate(raw_sequences):
+            arg = pulse_args[i]
+            if isinstance(arg, str) and ('(' in arg or '[' in arg):
+                expanded = [p for p in seq for _ in range(current_repeat)]
+                final = (expanded * (target_len // len(expanded) + 1))[:target_len]
+                current_repeat *= len(seq)
+            else:
+                final = (seq * (target_len // len(seq) + 1))[:target_len]
+            pulses_final.append(final)
+
+
+        if isinstance(p_input, (list, str)) and not any(ph in str(p_input).lower() for ph in ['x','y']):
+            if isinstance(p_input, str):
+                coeffs = [float(x) for x in re.findall(r'-?\d+\.?\d*', p_input)]
+            else:
+                coeffs = p_input
+                
+            receiver_indices = []
+            for step in range(target_len):
+                rec_sum = sum(coeffs[i] * pulses_final[i][step] 
+                              for i in range(min(len(coeffs), len(pulses_final))))
+                receiver_indices.append(int(round(rec_sum)) % 4)
+        else:
+            det_indices = parse_to_indices(p_input)
+            receiver_indices = (det_indices * (target_len // len(det_indices) + 1))[:target_len]
+
+        to_str = lambda indices: [phases[i] for i in indices]
+        return {"pulses": [to_str(p) for p in pulses_final], "receiver": to_str(receiver_indices)}
+
+# The worker class that run the digitizer in a different thread
+class Worker():
+    def __init__(self):
+        super(Worker, self).__init__()
+        # initialization of the attribute we use to stop the experimental script
+        # when button Stop is pressed
+        #from atomize.main.client import LivePlotClient
+
+        self.command = 'start'
+    
+    def dig_on(self, conn, decimation, l_mode, n_averages, win_left, win_right, rect1, rect2, rect3, rect4, rect5, rect6, rect7, laser_flag, rep_rate, mag_field, fft_flag, quad, zero_order, first_order, second_order, p_to_drop, laser_num, laser_qsw_delay, rect8, rect9, script_test=False):
+        """
+        function that contains updating of the digitizer.
+
+        When script_test is True, run a single-shot phasing validation pass
+        (enforce extra input checks, suppress 'Average'/'Message' callbacks,
+        plot without I/Q text in FFT mode, emit the composed pulse list at the end).
+        """
+        # should be inside dig_on() function;
+        # freezing after digitizer restart otherwise
+        import traceback
+
+        if script_test:
+            sys.argv = ['', 'test']
+
+        try:
+            import time
+            import numpy as np
+            import atomize.general_modules.general_functions as general
+            if script_test:
+                general.test_flag = 'test'
+            # Route this scan's plot_1d / plot_2d through the non-blocking
+            # coalescing worker so the acquisition loop isn't paced by the GUI.
+            general.set_plotting_async(True)
+            import atomize.device_modules.Insys_FPGA as pb_pro
+            import atomize.math_modules.fft as fft_module
+            import atomize.device_modules.BH_15 as itc
+
+            pb = pb_pro.Insys_FPGA()
+            
+            fft = fft_module.Fast_Fourier()
+            bh15 = itc.BH_15()
+            
+            #bh15.magnet_setup( mag_field, 0.5 )
+            bh15.magnet_field( mag_field ) #, calibration = 'True'
+
+            process = 'None'
+            
+            # decimation = digitizer decimation
+            # l_mode = live mode
+
+            #parameters for initial initialization
+
+            #win_left window left
+            #win_right window right
+            
+            pulses = [rect1, rect2, rect3, rect4, rect5, rect6, rect7, rect8, rect9]
+
+            for i, p in enumerate(pulses):
+                laser_ch = self._laser_channel(i, laser_flag)
+                if laser_flag >= 1 and laser_ch is None:
+                    start_val = float(p[1].split(' ')[0]) + laser_qsw_delay
+                    p[1] = f"{self.round_to_closest(start_val, 3.2)} ns"
+
+                length_val = int(float(p[2].split(' ')[0]))
+                if script_test and laser_ch is not None and length_val == 0:
+                    raise ValueError(f"{laser_ch} pulse has zero length")
+                if script_test and laser_ch is not None and laser_num == 1 and float(p[2].split(' ')[0]) < 1000:
+                    raise ValueError(f"{laser_ch} pulse is shorter than the Nd:YAG minimum of 1000 ns")
+
+                if length_val != 0:
+                    kwargs = {
+                        'name': f'P{i}',
+                        'channel': laser_ch or p[0],
+                        'start': p[1],
+                        'length': p[2]
+                    }
+
+                    if laser_ch is None:
+                        kwargs['phase_list'] = p[3]
+
+                    pb.pulser_pulse(**kwargs)
+
+            if laser_flag >= 1 and laser_num == 1:
+                pb.pulser_repetition_rate( '9.9 Hz' )
+            else:
+                pb.pulser_repetition_rate( str(rep_rate) + ' Hz' )
+
+
+            POINTS = 1
+            pb.digitizer_decimation(decimation)
+            # Live tuning runs in live_mode=1, which is always processed
+            # synchronously; disable the background processing thread
+            # explicitly so no worker resources are created in this process.
+            pb.digitizer_processing_thread(0)
+            DETECTION_WINDOW = round( pb.adc_window * 3.2, 1 )
+            TR_ADC = round(3.2 / 8, 1)
+            WIN_ADC = int( pb.adc_window * 8 / decimation )
+            auto_phase_req = False
+            auto_window_pts = 0
+            last_trace = None
+
+            #31/03/2026
+            if DETECTION_WINDOW <= 1200:
+                ms_per_point = 1e-3
+            else:
+                ms_per_point = 1e-2
+
+            data = np.zeros( ( 2, WIN_ADC, 1 ) )
+            ##data = np.random.random( ( 2, WIN_ADC, 1 ) )
+            x_axis = np.linspace(0, ( DETECTION_WINDOW - TR_ADC), num = WIN_ADC)
+
+            t_res = 0.4 * decimation
+
+            #31/03/2026
+            rep_rate = float(rep_rate)
+            if (n_averages / rep_rate ) < ms_per_point:
+                n_averages = int( ms_per_point * rep_rate)
+                if not script_test:
+                    conn.send( ('Average', n_averages) )
+
+            pb.digitizer_number_of_averages(n_averages)
+            PHASES = len( rect1[3] )
+            
+            #general.plot_remove('Dig')
+            
+            pb.pulser_open()
+
+            # Show the pulse list in the log right after (re)programming, so it is
+            # visible on every start and on every restart (a structural live edit
+            # tears down and re-runs this setup). Live edits refresh the same block
+            # in place from the 'PU' handler below.
+            if not script_test:
+                conn.send( ('PulseList', pb.pulser_pulse_list()) )
+
+            # the idea of automatic and dynamic changing is
+            # sending a new value of repetition rate via self.command
+            # in each cycle we will check the current value of self.command
+            # self.command = 'exit' will stop the digitizer
+            while self.command != 'exit':
+                # always test our self.command attribute for stopping the script when neccessary
+
+                if self.command[0:2] == 'PO':
+                    #points_value = int( self.command[2:] )
+                    #dig.digitizer_stop()
+                    #dig.digitizer_number_of_points( points_value )
+                    pass
+
+                elif self.command[0:2] == 'HO':
+                    #posstrigger_value = int( self.command[2:] )
+                    #dig.digitizer_stop()
+                    #dig.digitizer_posttrigger( posstrigger_value )
+                    pass
+
+                elif self.command[0:2] == 'LM':
+                    pass
+                    #l_mode = int( self.command[2:] )
+
+                elif self.command[0:2] == 'AR':
+                    # the next digitizer_get_curve() reallocates the accumulators
+                    pb.flag_adc_buffer = 0
+
+                elif self.command[0:2] == 'NA':
+                    n_averages = int( self.command[2:] )
+
+                    #31/03/2026
+                    if (n_averages / rep_rate ) < ms_per_point:
+                        n_averages = int( ms_per_point * rep_rate)
+                        if not script_test:
+                            conn.send( ('Average', n_averages) )
+
+                    pb.digitizer_number_of_averages( n_averages )
+
+                elif self.command[0:2] == 'WL':
+                    win_left = int( self.command[2:] )
+                elif self.command[0:2] == 'WR':
+                    win_right = int( self.command[2:] )
+                elif self.command[0:2] == 'RR':
+                    rep_rate = float( self.command[2:] )
+
+                    #31/03/2026
+                    if (n_averages / rep_rate ) < ms_per_point:
+                        n_averages = int( ms_per_point * rep_rate)
+                        pb.digitizer_number_of_averages( n_averages )
+                        if not script_test:
+                            conn.send( ('Average', n_averages) )
+
+                    if rep_rate > 49:
+                        pb.pulser_repetition_rate( str(rep_rate) + ' Hz' )
+                    elif not script_test:
+                        conn.send( ('Message', 'For REPETITION RATE lower then 50 Hz, please, press RUN PULSES') )
+
+                elif self.command[0:2] == 'FI':
+                    mag_field = float( self.command[2:] )
+                    bh15.magnet_field( mag_field ) #, calibration = 'True'
+                elif self.command[0:2] == 'FF':
+                    fft_flag = int( self.command[2:] )
+                elif self.command[0:2] == 'QC':
+                    quad = int( self.command[2:] )
+                elif self.command[0:2] == 'ZO':
+                    zero_order = float( self.command[2:] )
+                elif self.command[0:2] == 'AP':
+                    auto_phase_req = True
+                elif self.command[0:2] == 'AW':
+                    auto_window_pts = int( self.command[2:] )
+                elif self.command[0:2] == 'FO':
+                    first_order = float( self.command[2:] )
+                elif self.command[0:2] == 'SO':
+                    second_order = float( self.command[2:] )
+                elif self.command[0:2] == 'PD':
+                    p_to_drop = int( self.command[2:] )
+                elif self.command[0:2] == 'PU':
+                    # Live Edit: re-arm the running sequence with an edited pulse
+                    # table (Start / Length) without a card restart. Only pulses
+                    # already present in pulse_array_pulser are touched; adding or
+                    # removing a pulse is a structural change handled by a restart
+                    # on the GUI side, so an unknown name is simply skipped here.
+                    try:
+                        snap = json.loads( self.command[2:] )
+                    except (ValueError, TypeError):
+                        snap = None
+
+                    if snap is not None:
+                        # Validate the proposed table in a throwaway TEST-mode Insys
+                        # before committing. Start AND Length are live-editable here,
+                        # so an edit can create a genuine overlap the running preview
+                        # would then program blindly. The 'PU' snap is the full pulse
+                        # table, so rebuilding it into a fresh test-mode card and
+                        # running pulser_update() re-runs check_problem_pulses_*(),
+                        # whose overlap assert fires ONLY in test mode. pulser_open()
+                        # is intentionally not used: in test mode it skips the check
+                        # and would falsely assert "card already opened" against the
+                        # live status file. A rejected edit is dropped -- the real pb
+                        # is untouched, so the phase loop keeps the previous sequence.
+                        reject = None
+                        saved_argv = sys.argv
+                        saved_tf = general.test_flag
+                        try:
+                            sys.argv = ['', 'test']
+                            general.test_flag = 'test'
+                            pbt = pb_pro.Insys_FPGA()
+                            for idx, entry in enumerate(snap):
+                                if int(float(entry[2].split(' ')[0])) == 0:
+                                    continue
+                                laser_ch = self._laser_channel(idx, laser_flag)
+                                if laser_flag >= 1 and laser_ch is None:
+                                    start_val = float(entry[1].split(' ')[0]) + laser_qsw_delay
+                                    st = f"{self.round_to_closest(start_val, 3.2)} ns"
+                                else:
+                                    st = entry[1]
+                                kw = {'name': f'P{idx}', 'channel': laser_ch or entry[0],
+                                      'start': st, 'length': entry[2]}
+                                if laser_ch is None:
+                                    kw['phase_list'] = entry[3]
+                                pbt.pulser_pulse(**kw)
+                            pbt.pulser_repetition_rate( str(rep_rate) + ' Hz' )
+                            pbt.pulser_update()
+                        except AssertionError as ae:
+                            reject = str(ae) or 'pulses overlap after the edit'
+                        except BaseException as be:
+                            reject = str(be)
+                        finally:
+                            sys.argv = saved_argv
+                            general.test_flag = saved_tf
+
+                        if reject is not None:
+                            if not script_test:
+                                conn.send( ('LiveReject', reject) )
+                        else:
+                            # Write the new base into both the live array and the
+                            # init array: pulser_pulse_reset() deep-copies the init
+                            # array back over the live one after every phase cycle,
+                            # so an edit that skips the init copy would be reverted.
+                            live_by_name = { p['name']: p for p in pb.pulse_array_pulser }
+                            init_by_name = { p['name']: p for p in pb.pulse_array_init_pulser }
+                            for idx, entry in enumerate(snap):
+                                length_str = entry[2].split(' ')[0]
+                                if int(float(length_str)) == 0:
+                                    continue
+                                pulse = live_by_name.get(f'P{idx}')
+                                if pulse is None:
+                                    continue
+
+                                # Mirror the setup: non-laser pulses get the Q-switch delay shift.
+                                if laser_flag >= 1 and self._laser_channel(idx, laser_flag) is None:
+                                    start_val = float(entry[1].split(' ')[0]) + laser_qsw_delay
+                                    new_start = f"{self.round_to_closest(start_val, 3.2)} ns"
+                                else:
+                                    new_start = entry[1]
+
+                                pulse['start'] = new_start
+                                pulse['length'] = entry[2]
+                                init_pulse = init_by_name.get(f'P{idx}')
+                                if init_pulse is not None:
+                                    init_pulse['start'] = new_start
+                                    init_pulse['length'] = entry[2]
+                                pb.shift_count_pulser = 1
+
+                            # NB: do NOT call pb.pulser_update() here. The GIM engine
+                            # runs a strict 1:1 cadence -- each pulser_update() arms the
+                            # next instruction buffer and the *following* acquisition
+                            # drives the hardware switch to completion. A bare update
+                            # with no acquisition after it arms a buffer that is never
+                            # driven, so the next pulser_update() (inside
+                            # pulser_next_phase below) blocks on getGIM_swComp and
+                            # times out. Setting shift_count_pulser = 1 is enough: the
+                            # edit is applied by the pulser_next_phase()/pulser_update()
+                            # at the top of the phase loop, preserving the cadence.
+
+                            # Refresh the pulse list shown in the log so it reflects the
+                            # live-edited table (init array, same source pulser_close
+                            # uses). 'PulseList' is a side-effect-free message type that
+                            # the GUI refreshes in place -- unlike 'test', it must not
+                            # touch the message-pump timer while the preview is running.
+                            if not script_test:
+                                conn.send( ('PulseList', pb.pulser_pulse_list()) )
+
+                # check integration window
+                if win_left > WIN_ADC:
+                    win_left = WIN_ADC
+                if win_right > WIN_ADC:
+                    win_right = WIN_ADC
+
+                # phase cycle
+                PHASES = len( rect1[3] )
+
+                #pb.pulser_visualize()
+
+                for i in range( PHASES ):
+                    pb.pulser_next_phase()
+                    if l_mode == 0:
+                        data[0], data[1] = pb.digitizer_get_curve(POINTS, PHASES, live_mode = 1)
+                    elif l_mode == 1:
+                        # current_scan = 0: never block on the last phase, the board would repeat it meanwhile
+                        acc_i, acc_q = pb.digitizer_get_curve(POINTS, PHASES, live_mode = 0, current_scan = 0)
+                        if acc_i is None:
+                            continue
+                        data[0], data[1] = acc_i, acc_q
+                    ##general.wait('100 ms')
+                    ##data = np.random.random( ( 2, WIN_ADC, 1 ) )
+
+                    data_x = data[0].ravel()
+                    data_y = data[1].ravel()
+
+                    if quad == 0:
+                        data_x, data_y = pb.digitizer_demodulate(data_x, data_y, 0, zero_order, 0, 0)
+                    else:
+                        pass
+
+                    if np.isfinite(data_x).all() and np.isfinite(data_y).all():
+                        last_trace = (data_x.copy(), data_y.copy(), zero_order)
+
+                    if script_test and fft_flag == 1:
+                        # FFT mode in test: omit the I/Q text on the Dig plot since FFT is shown
+                        general.plot_1d('Dig', x_axis / 1e9, ( data_x, data_y ),
+                            xscale = 's', yscale = 'mV', label = 'ch',
+                            vline = (win_left * t_res / 1e9, win_right * t_res / 1e9)
+                            )
+                    else:
+                        int_x = round( np.sum( data_x[win_left:win_right] ) * 1 * t_res , 1 )
+                        int_y = round( np.sum( data_y[win_left:win_right] ) * 1 * t_res , 1 )
+
+                        general.plot_1d('Dig', x_axis / 1e9, ( data_x, data_y ),
+                            xscale = 's', yscale = 'mV', label = 'ch',
+                            vline = (win_left * t_res / 1e9, win_right * t_res / 1e9),
+                            text = 'I/Q ' + str(int_x) + '/' + str(int_y)
+                            )
+
+                    if fft_flag == 1:
+
+                        if quad == 0:
+                            freq_axis, abs_values = fft.fft(x_axis, data_x, data_y, t_res * 1)
+                            m_val = round( np.amax( abs_values ), 2 )
+                            #i_max = abs(round( freq_axis[ np.argmax( abs_values ) ], 2))
+                            general.plot_1d('FFT', freq_axis * 1e6, abs_values, xname = 'Offset',
+                                label = 'FFT', xscale = 'Hz',
+                                yscale = 'A.U.', text = 'Max ' + str(m_val)
+                                ) #str(m_val)
+                        else:
+                            if p_to_drop > max(0, len(data_x) - 2):
+                                p_to_drop = max(0, len(data_x) - 2)
+                                general.message('Maximum length of the data achieved. A number of drop points was corrected.')
+                            # fixed resolution of digitizer; 0.4 ns
+                            freq, fft_x, fft_y = fft.fft( x_axis[p_to_drop:] , data_x[p_to_drop:], data_y[p_to_drop:], t_res * 1, re = 'True' )
+                            data_fft = fft.ph_correction( freq, fft_x, fft_y, -zero_order, -first_order * 1e-9, -second_order * 1e-18 )
+                            general.plot_1d('FFT', freq * 1e6, ( data_fft[0], data_fft[1] ),
+                                xname = 'Offset', xscale = 'Hz',
+                                yscale = 'A.U.', label = 'FFT'
+                                )
+
+                if auto_phase_req and last_trace is not None:
+                    auto_phase_req = False
+                    tr_x, tr_y, tr_zo = last_trace
+                    if quad == 0 and win_right > win_left:
+                        integral = np.sum(tr_x[win_left:win_right] + 1j * tr_y[win_left:win_right])
+                        if np.isfinite(integral) and integral != 0:
+                            phase = (tr_zo + np.angle(integral)) % (2 * np.pi)
+                            conn.send(('AutoPhase', (float(np.degrees(phase)), float(np.abs(integral) * t_res))))
+                        else:
+                            conn.send(('Message', 'Auto phase: no signal in the integration window.'))
+                    else:
+                        conn.send(('Message', 'Auto phase needs time-domain mode and a non-empty integration window.'))
+
+                if auto_window_pts > 0 and last_trace is not None:
+                    width = min(auto_window_pts, WIN_ADC)
+                    auto_window_pts = 0
+                    envelope = np.abs(last_trace[0] + 1j * last_trace[1])
+                    if np.isfinite(envelope).all() and np.any(envelope > 0):
+                        smooth = np.convolve(envelope, np.ones(width) / width, mode = 'same')
+                        centre = int(np.argmax(smooth))
+                        # centre on the half-maximum centroid of the echo inside the window
+                        for _ in range(3):
+                            lo = min(max(centre - width // 2, 0), WIN_ADC - width)
+                            part = envelope[lo:lo + width] - np.median(envelope)
+                            part = np.clip(part - 0.5 * part.max(), 0, None)
+                            if part.sum() > 0:
+                                centre = int(round(lo + np.sum(np.arange(width) * part) / part.sum()))
+                        left = min(max(centre - width // 2, 0), WIN_ADC - width)
+                        right = left + width
+                        conn.send(('AutoWindow', (left * t_res, right * t_res, centre * t_res)))
+                    else:
+                        conn.send(('Message', 'Auto window: no signal in the detection window.'))
+
+                if not script_test:
+                    self.command = 'start'
+                    # Live count_nip readout: send the per-nid packet-count array
+                    # so the GUI can show acquisition progress dynamically. Sent
+                    # as its own message type so the parent updates only this line
+                    # and leaves the rest of the log intact. An all-zero array
+                    # carries no information (often the case intentionally), so
+                    # skip it rather than cluttering the log.
+                    try:
+                        if pb.count_nip is not None and np.any(pb.count_nip):
+                            conn.send( ('Count', np.array2string(pb.count_nip, max_line_width = np.inf, threshold = np.inf)) )
+                    except Exception:
+                        pass
+
+                if PHASES != 1:
+                    pb.pulser_pulse_reset()
+                else:
+                    pass
+
+                if script_test:
+                    self.command = 'exit'
+
+                # poll() checks whether there is data in the Pipe to read
+                # we use it to stop the script if the exit command was sent from the main window
+                # we read data by conn.recv() only when there is the data to read
+                if conn.poll() == True:
+                    self.command = conn.recv()
+
+            if self.command == 'exit':
+                #print('exit')
+                pb.pulser_close()
+                if not script_test:
+                    conn.send( ('', f'Pulses are stopped') )
+                else:
+                    # The composed pulse list is now shown live via 'PulseList'
+                    # after pulser_open in the real preview, so the preflight copy
+                    # here is redundant. Keep only the TOO-MANY-PHASES warning.
+                    if PHASES >= pb.number_adc_window_in_buffer():
+                        str1 = 'PHASE CYCLE EXCEEDS ADC BUFFER: LIVE PREVIEW UPDATES ONCE PER FULL CYCLE\n'
+                        str2 = 'ADC WINDOWS IN BUFFER: '
+                        str3 = '\nTraces update once all steps arrive and average any repeats, so noise can differ between traces.'
+                        conn.send( ('test', f'{str1}{str2}{pb.number_adc_window_in_buffer()}{str3}') )
+                    conn.close()
+
+        except BaseException as e:
+            exc_info = f"{type(e)} \n{str(e)} \n{traceback.format_exc()}"
+            conn.send( ('Error', exc_info) )
+        finally:
+            # Always release the FPGA card, on every exit path (normal, Stop, or
+            # exception). The card can only be freed by this process, so this is
+            # the last line of defence against leaving it in an open state.
+            try:
+                pb.pulser_close()
+            except Exception:
+                pass
+
+    def round_to_closest(self, x, y):
+        """
+        A function to round x to divisible by y
+        """
+        return round(( y * ( ( x // y ) + (round(x % y, 2) > 0) ) ), 1)
+
+    @staticmethod
+    def _laser_channel(idx, laser_flag):
+        """Pulser channel of pulse-list index idx if it is a laser row (P2 -> LASER_1, P3 -> LASER_2), else None."""
+        return f'LASER_{idx}' if 1 <= idx <= laser_flag else None
+
+    def exp(self, conn, decimation, num_ave, scans, points,
+            win_left, exp_name, curve_name,
+            win_right, rect1, rect2, rect3, rect4,
+            rect5, rect6, rect7, rect8, rect9, laser_flag,
+            rep_rate, field, laser_num, q_switch_delay, x0, xd,
+            zero_order, first_order, sec_order, ph_cor, script_test=False):
+
+        import traceback
+
+        if script_test:
+            sys.argv = ['', 'test']
+
+        try:
+            #import random
+            import time
+            import datetime
+            import numpy as np
+            import atomize.general_modules.general_functions as general
+            if script_test:
+                general.test_flag = 'test'
+            # Route this scan's plot_1d / plot_2d through the non-blocking
+            # coalescing worker so the acquisition loop isn't paced by the GUI.
+            general.set_plotting_async(True)
+            import atomize.device_modules.Insys_FPGA as pb_pro
+            import atomize.device_modules.Lakeshore_335 as ls
+            import atomize.device_modules.BH_15 as bh
+            import atomize.device_modules.Micran_X_band_MW_bridge_v2 as mwBridge
+            import atomize.general_modules.csv_opener_saver as openfile
+
+            pb = pb_pro.Insys_FPGA()
+            file_handler = openfile.Saver_Opener()
+            bh15 = bh.BH_15()
+            ls335 = ls.Lakeshore_335()
+            mw = mwBridge.Micran_X_band_MW_bridge_v2()
+
+            pb.win_left = win_left
+            pb.win_right = win_right
+
+            if xd == 0.0:
+                pulses2 = [rect2, rect3, rect4, rect5, rect6, rect7, rect8, rect9]
+                #rect1 DETECTION
+                if rect1[4] != '0.0 ns':
+                    #delta_start
+                    step = round( float( rect1[4].split(' ')[0] ), 1)
+                    for p in pulses2:
+                        if p[5] != '0.0 ns':
+                            f_delay = self.round_to_closest( float(p[2].split(' ')[0]), 3.2)
+                            break
+                        else:
+                            f_delay = self.round_to_closest( float(rect1[1].split(' ')[0]), 3.2)
+                elif rect1[5] != '0.0 ns':
+                    #length_increment
+                    step = round( float( rect1[5].split(' ')[0] ), 1)
+                    f_delay = self.round_to_closest( float(rect1[2].split(' ')[0]), 3.2)
+                else:                
+                    for p in pulses2:
+                        if p[4] != '0.0 ns':
+                            step = round( float( p[4].split(' ')[0] ), 1)
+                            f_delay = self.round_to_closest( float(p[1].split(' ')[0]), 3.2)
+                            break
+                        else:
+                            #prevent no increment
+                            step = 1
+                            f_delay = 0
+            
+            else:
+                step = round( xd, 1 )
+                f_delay =  self.round_to_closest( x0, 3.2 )
+
+            if step == 1 and not script_test:
+                conn.send( ('Message', 'No START or LENGTH increment; the time axis corresponds to the number of points in the experiment') )
+                general.plot_remove(exp_name)
+
+            POINTS = points
+            STEP = step
+            FIELD = field
+            AVERAGES = num_ave
+            SCANS = scans
+            PHASES = len(rect1[3])
+            DEC_COEF = decimation
+            process = 'None'
+            REP_RATE = f'{rep_rate} Hz'
+            EXP_NAME = exp_name
+            CURVE_NAME = curve_name
+
+            bh15.magnet_field( field )
+            general.wait('2000 ms')
+
+            pulses = [
+                    rect1, rect2, rect3, rect4, 
+                    rect5, rect6, rect7, rect8, 
+                    rect9
+                    ]
+
+            for i, p in enumerate(pulses):
+                laser_ch = self._laser_channel(i, laser_flag)
+                if laser_flag >= 1 and laser_ch is None:
+                    start_val = float(p[1].split(' ')[0]) + q_switch_delay
+                    p[1] = f"{self.round_to_closest(start_val, 3.2)} ns"
+
+                length_val = int(float(p[2].split(' ')[0]))
+                if script_test and laser_ch is not None and length_val == 0:
+                    raise ValueError(f"{laser_ch} pulse has zero length")
+                if script_test and laser_ch is not None and laser_num == 1 and float(p[2].split(' ')[0]) < 1000:
+                    raise ValueError(f"{laser_ch} pulse is shorter than the Nd:YAG minimum of 1000 ns")
+
+                if length_val != 0:
+                    kwargs = {
+                        'name': f'P{i}',
+                        'channel': laser_ch or p[0],
+                        'start': p[1],
+                        'length': p[2],
+                        'delta_start': p[4],
+                        'length_increment': p[5]
+                    }
+
+                    if laser_ch is None:
+                        kwargs['phase_list'] = p[3]
+
+                    pb.pulser_pulse(**kwargs)
+
+            if laser_flag >= 1 and laser_num == 1:
+                pb.pulser_repetition_rate( '9.9 Hz' )
+            else:
+                pb.pulser_repetition_rate( REP_RATE )
+
+            pb.digitizer_decimation(DEC_COEF)
+            #points_window = pb.digitizer_window_points()
+
+            pb.pulser_open()
+            pb.digitizer_number_of_averages(AVERAGES)
+            data = np.zeros( ( 2, POINTS ) )
+            x_axis = f_delay + np.linspace(0, (POINTS - 1)*STEP, num = POINTS)
+            x_axis_plot = x_axis / 1e9
+            a = 0
+
+            def _scan_iter():
+                if script_test:
+                    yield from general.scans(SCANS)
+                else:
+                    k = 1
+                    while k <= SCANS:
+                        yield k
+                        k += 1
+
+            while self.command != 'exit':
+
+                for k in _scan_iter():
+                    sp = ls335.tc_setpoint()
+                    ct = ls335.tc_temperature('B')
+
+                    if not script_test:
+                        temp_param.write_status(setpoint=sp, temp_b=ct)
+
+                    if np.abs(sp - ct) > 0.8:
+                        general.wait('8000 ms')
+
+                    if self.command == 'exit':
+                        break
+
+                    for j in range(POINTS):
+                        for i in range(PHASES):
+
+                            pb.pulser_next_phase()
+
+                            if (not script_test) or j == 0:
+                                if a is not None:
+                                    if step != 1:
+                                        general.plot_1d(EXP_NAME, x_axis_plot, ( data[0], data[1] ), xname = 'Time', xscale = 's', yname = 'Area', yscale = 'A.U.', label = curve_name, text = 'Scan / Time: ' + str(k) + ' / ' + str(round(j*STEP, 1)))
+                                    else:
+                                        general.plot_1d(EXP_NAME, x_axis, ( data[0], data[1] ), xname = 'Point', xscale = '', yname = 'Area', yscale = 'A.U.', label = curve_name, text = 'Scan / Time: ' + str(k) + ' / ' + str(round(j, 1)))
+
+                                # Partial-range readout: only the point range recomputed
+                                # from this call's buffers comes back; patch it into the
+                                # persistent data array instead of copying the full curve.
+                                a, b, rng = pb.digitizer_get_curve( POINTS, PHASES, current_scan = k, total_scan = SCANS, integral = True, partial = True )
+                                if a is not None:
+                                    data[0][rng[0]:rng[1]] = a
+                                    data[1][rng[0]:rng[1]] = b
+
+                        pb.pulser_shift()
+                        pb.pulser_increment()
+
+                        if not script_test:
+                            conn.send( ('Status', int( 100 * (( k - 1 ) * POINTS + j + 1) / POINTS / SCANS)) )
+
+                        # check our polling data
+                        if self.command[0:2] == 'SC':
+                            SCANS = int( self.command[2:] )
+                            self.command = 'start'
+                        elif self.command == 'exit':
+                            data[0], data[1] = pb.digitizer_at_exit(integral = True)
+                            break
+
+                        if conn.poll() == True:
+                            self.command = conn.recv()
+
+                    pb.pulser_pulse_reset()
+
+                self.command = 'exit'
+
+            if self.command == 'exit':
+                # Final readout before releasing the card: digitizer_at_exit()
+                # waits for the background processing thread to finish the
+                # queued buffers and recomputes the exact accumulated state.
+                # Covers natural completion of all scans; the Stop path inside
+                # the loop already did the same (repeating it is harmless).
+                data[0], data[1] = pb.digitizer_at_exit(integral = True)
+                tb = round( pb.digitizer_window(), 1)
+                pb.pulser_close()
+
+                if step != 1:
+                    general.plot_1d(EXP_NAME, x_axis_plot, ( data[0], data[1] ), xname = 'Time', xscale = 's', yname = 'Area', yscale = 'A.U.', label = curve_name, text = 'Scan / Time: ' + str(k) + ' / ' + str(round(j*STEP, 1)))
+                else:
+                    general.plot_1d(EXP_NAME, x_axis, ( data[0], data[1] ), xname = 'Point', xscale = '', yname = 'Area', yscale = 'A.U.', label = curve_name, text = 'Scan / Time: ' + str(k) + ' / ' + str(round(j, 1)))
+
+                now = datetime.datetime.now().strftime("%d-%m-%Y %H-%M-%S")
+                w = 30
+                
+                # Data saving
+                header = (
+                    f"{'Date:':<{w}} {now}\n"
+                    f"{'Experiment:':<{w}} Pulsed EPR Experiment\n"
+                    f"{'Field:':<{w}} {FIELD} G\n"
+                    f"{general.fmt(mw.mw_bridge_rotary_vane(), w)}\n"
+                    f"{general.fmt(mw.mw_bridge_att_prm(), w)}\n"
+                    f"{general.fmt(mw.mw_bridge_att2_prm(), w)}\n"
+                    f"{general.fmt(mw.mw_bridge_att1_prd(), w)}\n"
+                    f"{general.fmt(mw.mw_bridge_synthesizer(), w)}\n"
+                    f"{'Repetition Rate:':<{w}} {pb.pulser_repetition_rate()}\n"
+                    f"{'Number of Scans:':<{w}} {SCANS}\n"
+                    f"{'Averages:':<{w}} {AVERAGES}\n"
+                    f"{'Points:':<{w}} {POINTS}\n"
+                    f"{'Window:':<{w}} {tb} ns\n"
+                    f"{'Horizontal Resolution:':<{w}} {STEP} ns\n"
+                    f"{'Temperature:':<{w}} {ls335.tc_temperature('A')} K\n"
+                    f"{'Temperature Cernox:':<{w}} {ls335.tc_temperature('B')} K\n"
+                    f"{'-'*50}\n"
+                    f"Pulse List:\n{pb.pulser_pulse_list()}"
+                    f"{'-'*50}\n"
+                    f"Time (s), I (A.U.), Q (A.U.)"
+                )
+
+                if script_test:
+                    conn.send( ('test', f'') )
+                else:
+                    conn.send(('Open', ''))
+
+                    while True:
+                        if conn.poll():
+                            msg = conn.recv()
+                            if msg.startswith('FL'):
+                                file_data = msg[2:]
+                                break
+                        general.wait('200 ms')
+
+
+                    file_handler.save_data(file_data, np.c_[x_axis_plot, data[0], data[1]], header = header, mode = 'w')
+
+                    conn.send( ('', f'Experiment {EXP_NAME} finished') )
+
+        except BaseException as e:
+            exc_info = f"{type(e)} \n{str(e)} \n{traceback.format_exc()}"
+            conn.send( ('Error', exc_info) )
+        finally:
+            # Always release the FPGA card, on every exit path (normal, Stop, or
+            # exception). The card can only be freed by this process, so this is
+            # the last line of defence against leaving it in an open state.
+            try:
+                pb.pulser_close()
+            except Exception:
+                pass
+
+    def exp_field(self, conn, decimation, num_ave, scans, start_field,
+            end_field, step_field, win_left, exp_name, curve_name,
+            win_right, rect1, rect2, rect3, rect4,
+            rect5, rect6, rect7, rect8, rect9, laser_flag,
+            rep_rate, laser_num, q_switch_delay,
+            zero_order, first_order, sec_order, ph_cor, script_test=False):
+
+        import traceback
+
+        if script_test:
+            sys.argv = ['', 'test']
+
+        try:
+            import time
+            import datetime
+            import numpy as np
+            import atomize.general_modules.general_functions as general
+            if script_test:
+                general.test_flag = 'test'
+            # Route this scan's plot_1d / plot_2d through the non-blocking
+            # coalescing worker so the acquisition loop isn't paced by the GUI.
+            general.set_plotting_async(True)
+            import atomize.device_modules.Insys_FPGA as pb_pro
+            import atomize.device_modules.Lakeshore_335 as ls
+            import atomize.device_modules.BH_15 as bh
+            import atomize.device_modules.Micran_X_band_MW_bridge_v2 as mwBridge
+            import atomize.general_modules.csv_opener_saver as openfile
+
+            file_handler = openfile.Saver_Opener()
+            pb = pb_pro.Insys_FPGA()
+            bh15 = bh.BH_15()
+            ls335 = ls.Lakeshore_335()
+            mw = mwBridge.Micran_X_band_MW_bridge_v2()
+
+            pb.win_left = win_left
+            pb.win_right = win_right
+
+            START_FIELD = start_field
+            END_FIELD = end_field
+            FIELD_STEP = step_field
+            
+            AVERAGES = num_ave
+            SCANS = scans
+            PHASES = len(rect1[3])
+            DEC_COEF = decimation
+            process = 'None'
+            REP_RATE = f'{rep_rate} Hz'
+            EXP_NAME = f'{exp_name}_F'
+            CURVE_NAME = curve_name
+
+            bh15.magnet_field( start_field )
+            general.wait('2000 ms')
+
+            pulses = [
+                    rect1, rect2, rect3, rect4, 
+                    rect5, rect6, rect7, rect8, 
+                    rect9
+                    ]
+
+            for i, p in enumerate(pulses):
+                if script_test and p[4] != '0.0 ns':
+                    raise ValueError("Please remove Start Increments for all pulses")
+
+                laser_ch = self._laser_channel(i, laser_flag)
+                if laser_flag >= 1 and laser_ch is None:
+                    start_val = float(p[1].split(' ')[0]) + q_switch_delay
+                    p[1] = f"{self.round_to_closest(start_val, 3.2)} ns"
+
+                length_val = int(float(p[2].split(' ')[0]))
+                if script_test and laser_ch is not None and length_val == 0:
+                    raise ValueError(f"{laser_ch} pulse has zero length")
+                if script_test and laser_ch is not None and laser_num == 1 and float(p[2].split(' ')[0]) < 1000:
+                    raise ValueError(f"{laser_ch} pulse is shorter than the Nd:YAG minimum of 1000 ns")
+
+                if length_val != 0:
+                    kwargs = {
+                        'name': f'P{i}',
+                        'channel': laser_ch or p[0],
+                        'start': p[1],
+                        'length': p[2],
+                        'delta_start': p[4],
+                        'length_increment': p[5]
+                    }
+
+                    if laser_ch is None:
+                        kwargs['phase_list'] = p[3]
+
+                    pb.pulser_pulse(**kwargs)
+
+            if laser_flag >= 1 and laser_num == 1:
+                pb.pulser_repetition_rate( '9.9 Hz' )
+            else:
+                pb.pulser_repetition_rate( REP_RATE )
+
+
+            pb.digitizer_decimation(DEC_COEF)
+            #points_window = pb.digitizer_window_points()
+
+            pb.pulser_open()
+            pb.digitizer_number_of_averages(AVERAGES)
+
+            POINTS = int( (END_FIELD - START_FIELD) / FIELD_STEP ) + 1
+            data = np.zeros( ( 2, POINTS ) )
+            x_axis = np.linspace(START_FIELD, END_FIELD, num = POINTS)
+            a = 0
+
+            def _scan_iter():
+                if script_test:
+                    yield from general.scans(SCANS)
+                else:
+                    k = 1
+                    while k <= SCANS:
+                        yield k
+                        k += 1
+
+            while self.command != 'exit':
+
+                for k in _scan_iter():
+
+                    field = START_FIELD
+                    bh15.magnet_field(field)
+
+                    sp = ls335.tc_setpoint()
+                    ct = ls335.tc_temperature('B')
+
+                    if not script_test:
+                        temp_param.write_status(setpoint=sp, temp_b=ct)
+
+                    if np.abs(sp - ct) > 0.8:
+                        general.wait('8000 ms')
+
+                    if self.command == 'exit':
+                        break
+
+                    for j in range(POINTS):
+
+                        bh15.magnet_field(field)#, calibration = 'True')
+
+                        for i in range(PHASES):
+
+                            if (not script_test) or j == 0:
+                                if a is not None:
+                                    process = general.plot_1d(EXP_NAME, x_axis, ( data[0], data[1] ), xname = 'Field', xscale = 'G', yname = 'Area', yscale = 'A.U.', label = curve_name, text = 'Scan / Field: ' + str(k) + ' / ' + str(field), pr = process)
+
+                            pb.pulser_next_phase()
+
+                            if (not script_test) or j == 0:
+                                # Partial-range readout: only the point range recomputed
+                                # from this call's buffers comes back; patch it into the
+                                # persistent data array instead of copying the full curve.
+                                a, b, rng = pb.digitizer_get_curve( POINTS, PHASES, current_scan = k, total_scan = SCANS, integral = True, partial = True )
+                                if a is not None:
+                                    data[0][rng[0]:rng[1]] = a
+                                    data[1][rng[0]:rng[1]] = b
+
+                        field = round( (FIELD_STEP + field), 3 )
+
+                        pb.pulser_shift()
+
+                        if not script_test:
+                            conn.send( ('Status', int( 100 * (( k - 1 ) * POINTS + j + 1) / POINTS / SCANS)) )
+
+                        # check our polling data
+                        if self.command[0:2] == 'SC':
+                            SCANS = int( self.command[2:] )
+                            self.command = 'start'
+                        elif self.command == 'exit':
+                            data[0], data[1] = pb.digitizer_at_exit(integral = True)
+                            break
+
+                        if conn.poll() == True:
+                            self.command = conn.recv()
+
+                    pb.pulser_pulse_reset()
+
+                    general.wait('1000 ms')
+
+                    while field > START_FIELD:
+                        field -= 100
+                        bh15.magnet_field( field )
+
+                self.command = 'exit'
+
+            if self.command == 'exit':
+                # Final readout before releasing the card: digitizer_at_exit()
+                # waits for the background processing thread to finish the
+                # queued buffers and recomputes the exact accumulated state.
+                # Covers natural completion of all scans; the Stop path inside
+                # the loop already did the same (repeating it is harmless).
+                data[0], data[1] = pb.digitizer_at_exit(integral = True)
+                tb = round( pb.digitizer_window(), 1)
+                pb.pulser_close()
+
+                general.plot_1d(EXP_NAME, x_axis, ( data[0], data[1] ), xname = 'Field', xscale = 'G', yname = 'Area', yscale = 'A.U.', label = curve_name, text = 'Scan / Field: ' + str(k) + ' / ' + str(field))
+
+                now = datetime.datetime.now().strftime("%d-%m-%Y %H-%M-%S")
+                w = 30
+
+                # Data saving
+                header = (
+                    f"{'Date:':<{w}} {now}\n"
+                    f"{'Experiment:':<{w}} Pulsed EPR Experiment\n"
+                    f"{'Start Field:':<{w}} {START_FIELD} G\n"
+                    f"{'End Field:':<{w}} {END_FIELD} G\n"
+                    f"{'Field Step:':<{w}} {FIELD_STEP} G\n"
+                    f"{general.fmt(mw.mw_bridge_rotary_vane(), w)}\n"
+                    f"{general.fmt(mw.mw_bridge_att_prm(), w)}\n"
+                    f"{general.fmt(mw.mw_bridge_att2_prm(), w)}\n"
+                    f"{general.fmt(mw.mw_bridge_att1_prd(), w)}\n"
+                    f"{general.fmt(mw.mw_bridge_synthesizer(), w)}\n"
+                    f"{'Repetition Rate:':<{w}} {pb.pulser_repetition_rate()}\n"
+                    f"{'Number of Scans:':<{w}} {SCANS}\n"
+                    f"{'Averages:':<{w}} {AVERAGES}\n"
+                    f"{'Window:':<{w}} {tb} ns\n"
+                    f"{'Temperature:':<{w}} {ls335.tc_temperature('A')} K\n"
+                    f"{'Temperature Cernox:':<{w}} {ls335.tc_temperature('B')} K\n"
+                    f"{'-'*50}\n"
+                    f"Pulse List:\n{pb.pulser_pulse_list()}"
+                    f"{'-'*50}\n"
+                    f"Field (G), I (A.U.), Q (A.U.)"
+                )
+
+                if script_test:
+                    conn.send( ('test', f'') )
+                else:
+                    conn.send(('Open', ''))
+
+                    while True:
+                        if conn.poll():
+                            msg = conn.recv()
+                            if msg.startswith('FL'):
+                                file_data = msg[2:]
+                                break
+                        general.wait('200 ms')
+
+
+                    file_handler.save_data(file_data, np.c_[x_axis, data[0], data[1]], header = header, mode = 'w')
+
+                    conn.send( ('', f'Experiment {EXP_NAME} finished') )
+
+        except BaseException as e:
+            exc_info = f"{type(e)} \n{str(e)} \n{traceback.format_exc()}"
+            conn.send( ('Error', exc_info) )
+        finally:
+            # Always release the FPGA card, on every exit path (normal, Stop, or
+            # exception). The card can only be freed by this process, so this is
+            # the last line of defence against leaving it in an open state.
+            try:
+                pb.pulser_close()
+            except Exception:
+                pass
+
+    def exp_log(self, conn, decimation, num_ave, scans, points,
+            log_start, log_end, win_left, exp_name, curve_name,
+            win_right, rect1, rect2, rect3, rect4,
+            rect5, rect6, rect7, rect8, rect9, laser_flag,
+            rep_rate, field, laser_num, q_switch_delay, x0, xd,
+            zero_order, first_order, sec_order, ph_cor, script_test=False):
+
+        import traceback
+
+        if script_test:
+            sys.argv = ['', 'test']
+
+        try:
+            import time
+            import datetime
+            import numpy as np
+            import atomize.general_modules.general_functions as general
+            if script_test:
+                general.test_flag = 'test'
+            # Route this scan's plot_1d / plot_2d through the non-blocking
+            # coalescing worker so the acquisition loop isn't paced by the GUI.
+            general.set_plotting_async(True)
+            import atomize.device_modules.Insys_FPGA as pb_pro
+            import atomize.device_modules.Lakeshore_335 as ls
+            import atomize.device_modules.BH_15 as bh
+            import atomize.device_modules.Micran_X_band_MW_bridge_v2 as mwBridge
+            import atomize.general_modules.csv_opener_saver as openfile
+
+            ### Nonlinear axis
+            POINTS = points
+            T_start = log_start
+            T_end = log_end
+
+            nonlinear_time_raw = 10 ** np.linspace( T_start, T_end, POINTS )
+            nonlinear_time = np.unique( general.numpy_round( nonlinear_time_raw, 3.2 ) )
+            nonlinear_diff = np.append(np.diff(nonlinear_time), 0)
+            original_time = np.concatenate(([0], nonlinear_diff)).cumsum()
+            POINTS = len( nonlinear_time )
+            x_axis = original_time[:-1]
+
+            file_handler = openfile.Saver_Opener()
+            pb = pb_pro.Insys_FPGA()
+            bh15 = bh.BH_15()
+            ls335 = ls.Lakeshore_335()
+            mw = mwBridge.Micran_X_band_MW_bridge_v2()
+
+            pb.win_left = win_left
+            pb.win_right = win_right
+
+            FIELD = field
+            AVERAGES = num_ave
+            SCANS = scans
+            PHASES = len(rect1[3])
+            DEC_COEF = decimation
+            process = 'None'
+            REP_RATE = f'{rep_rate} Hz'
+            EXP_NAME = f'{exp_name}_L'
+            CURVE_NAME = curve_name
+
+            bh15.magnet_field( field )
+            general.wait('2000 ms')
+
+
+            #### Creating different delays for different pulses
+            name_list = []
+            rel_shift = np.array( [] )
+            pulses = [
+                    rect1, rect2, rect3, rect4, 
+                    rect5, rect6, rect7, rect8, 
+                    rect9
+                    ]
+
+            for p in pulses:
+                length_str = p[2].split(' ')[0]
+                if int(float(length_str)) != 0:
+                    rel_shift = np.append(rel_shift, float(p[4].split(' ')[0]) ) 
+            
+            # do not take into account the same shift
+            unique_arr = np.unique(rel_shift)
+            minim = np.min(unique_arr)
+            rel_shift -= minim
+
+            unique_arr = np.unique(rel_shift)
+            if len(unique_arr) > 1:
+                next_after_min = np.partition(unique_arr, 1)[1]
+            else:
+                next_after_min = 1
+
+            rel_shift = ( (rel_shift ) / next_after_min).astype(int)
+
+            if rel_shift[0] != 0.0:
+                if x0 == 0:
+                    x_axis = x_axis * rel_shift[0] + self.round_to_closest( float(rect1[1].split(" ")[0]) , 3.2)
+                else:
+                    x_axis = x_axis * rel_shift[0] + x0
+            else:
+                indices = np.where(rel_shift[1:] != 0)[0] + 1
+                if indices.size > 0:
+                    if x0 == 0:
+                        x_axis = x_axis * rel_shift[indices[0]] + self.round_to_closest( float(pulses[indices[0]][1].split(" ")[0]) , 3.2)
+                    else:
+                        x_axis = x_axis * rel_shift[indices[0]] + x0
+                else:
+                    ## this is for start increments: [3.2 3.2 3.2]
+                    raise ValueError(f"Pulses do not have Start Increments")
+            ####
+
+            # rel_shift was built with one entry per non-zero pulse, so
+            # we can't index it by the pulses-list position; track the
+            # actual rel_shift slot with a counter that mirrors the
+            # build order.
+            rs_idx = 0
+            for i, p in enumerate(pulses):
+                laser_ch = self._laser_channel(i, laser_flag)
+                if laser_flag >= 1 and laser_ch is None:
+                    start_val = float(p[1].split(' ')[0]) + q_switch_delay
+                    p[1] = f"{self.round_to_closest(start_val, 3.2)} ns"
+
+                length_val = int(float(p[2].split(' ')[0]))
+                if script_test and laser_ch is not None and length_val == 0:
+                    raise ValueError(f"{laser_ch} pulse has zero length")
+                if script_test and laser_ch is not None and laser_num == 1 and float(p[2].split(' ')[0]) < 1000:
+                    raise ValueError(f"{laser_ch} pulse is shorter than the Nd:YAG minimum of 1000 ns")
+
+                if length_val != 0:
+                    name_list.append(f'P{i}')
+                    kwargs = {
+                        'name': f'P{i}',
+                        'channel': laser_ch or p[0],
+                        'start': p[1],
+                        'length': p[2],
+                        'delta_start': f"{self.round_to_closest( nonlinear_diff[0] * rel_shift[rs_idx], 3.2 )} ns"
+                    }
+
+                    if laser_ch is None:
+                        kwargs['phase_list'] = p[3]
+
+                    pb.pulser_pulse(**kwargs)
+                    rs_idx += 1
+
+            if laser_flag >= 1 and laser_num == 1:
+                pb.pulser_repetition_rate( '9.9 Hz' )
+            else:
+                pb.pulser_repetition_rate( REP_RATE )
+
+
+            pb.digitizer_decimation(DEC_COEF)
+            #points_window = pb.digitizer_window_points()
+
+            pb.pulser_open()
+            pb.digitizer_number_of_averages(AVERAGES)
+            data = np.zeros( ( 2, POINTS ) )
+            x_axis_plot = x_axis / 1e9
+            a = 0
+
+            def _scan_iter():
+                if script_test:
+                    yield from general.scans(SCANS)
+                else:
+                    k = 1
+                    while k <= SCANS:
+                        yield k
+                        k += 1
+
+            while self.command != 'exit':
+
+                for k in _scan_iter():
+
+                    sp = ls335.tc_setpoint()
+                    ct = ls335.tc_temperature('B')
+
+                    if not script_test:
+                        temp_param.write_status(setpoint=sp, temp_b=ct)
+
+                    if np.abs(sp - ct) > 0.8:
+                        general.wait('8000 ms')
+
+                    if self.command == 'exit':
+                        break
+
+                    for j in range(POINTS):
+
+                        for i in range(PHASES):
+
+                            pb.pulser_next_phase()
+
+                            if (not script_test) or j == 0:
+                                if a is not None:
+                                    process = general.plot_1d(EXP_NAME, x_axis_plot, ( data[0], data[1] ), xname = 'Time', xscale = 's', yname = 'Area', yscale = 'A.U.', label = curve_name, text = 'Scan / Point: ' + str(k) + ' / ' + str(j), pr = process)
+
+                                # Partial-range readout: only the point range recomputed
+                                # from this call's buffers comes back; patch it into the
+                                # persistent data array instead of copying the full curve.
+                                a, b, rng = pb.digitizer_get_curve( POINTS, PHASES, current_scan = k, total_scan = SCANS, integral = True, partial = True )
+                                if a is not None:
+                                    data[0][rng[0]:rng[1]] = a
+                                    data[1][rng[0]:rng[1]] = b
+
+                        # nonlinear_time_shift is calculated from the initial position of the pulses
+                        if j > 0:
+                            new_delta_start = nonlinear_diff[j]
+
+                            delta_starts = [f"{self.round_to_closest(x * new_delta_start, 3.2)} ns" for x in rel_shift]
+                            pb.pulser_redefine_delta_start(name = name_list, delta_start = delta_starts )
+
+                        pb.pulser_shift()
+
+                        if not script_test:
+                            conn.send( ('Status', int( 100 * (( k - 1 ) * POINTS + j + 1) / POINTS / SCANS)) )
+
+                        # check our polling data
+                        if self.command[0:2] == 'SC':
+                            SCANS = int( self.command[2:] )
+                            self.command = 'start'
+                        elif self.command == 'exit':
+                            data[0], data[1] = pb.digitizer_at_exit(integral = True)
+                            break
+
+                        if conn.poll() == True:
+                            self.command = conn.recv()
+
+                    pb.pulser_pulse_reset()
+
+                self.command = 'exit'
+
+            if self.command == 'exit':
+                # Final readout before releasing the card: digitizer_at_exit()
+                # waits for the background processing thread to finish the
+                # queued buffers and recomputes the exact accumulated state.
+                # Covers natural completion of all scans; the Stop path inside
+                # the loop already did the same (repeating it is harmless).
+                data[0], data[1] = pb.digitizer_at_exit(integral = True)
+                tb = round( pb.digitizer_window(), 1)
+                pb.pulser_close()
+
+                general.plot_1d(EXP_NAME, x_axis_plot, ( data[0], data[1] ), xname = 'Time', xscale = 's', yname = 'Area', yscale = 'A.U.', label = curve_name, text = 'Scan / Point: ' + str(k) + ' / ' + str(j))
+
+                now = datetime.datetime.now().strftime("%d-%m-%Y %H-%M-%S")
+                w = 30
+
+                # Data saving
+                header = (
+                    f"{'Date:':<{w}} {now}\n"
+                    f"{'Experiment:':<{w}} Pulsed EPR Log Experiment\n"
+                    f"{'Field:':<{w}} {FIELD} G\n"
+                    f"{general.fmt(mw.mw_bridge_rotary_vane(), w)}\n"
+                    f"{general.fmt(mw.mw_bridge_att_prm(), w)}\n"
+                    f"{general.fmt(mw.mw_bridge_att2_prm(), w)}\n"
+                    f"{general.fmt(mw.mw_bridge_att1_prd(), w)}\n"
+                    f"{general.fmt(mw.mw_bridge_synthesizer(), w)}\n"
+                    f"{'Repetition Rate:':<{w}} {pb.pulser_repetition_rate()}\n"
+                    f"{'Number of Scans:':<{w}} {SCANS}\n"
+                    f"{'Averages:':<{w}} {AVERAGES}\n"
+                    f"{'Points:':<{w}} {POINTS}\n"
+                    f"{'Window:':<{w}} {tb} ns\n"
+                    f"{'Lg(X0/ns):':<{w}} {T_start}\n"
+                    f"{'Lg(ΔX/ns):':<{w}} {T_end}\n"
+                    f"{'Temperature:':<{w}} {ls335.tc_temperature('A')} K\n"
+                    f"{'Temperature Cernox:':<{w}} {ls335.tc_temperature('B')} K\n"
+                    f"{'-'*50}\n"
+                    f"Pulse List:\n{pb.pulser_pulse_list()}"
+                    f"{'-'*50}\n"
+                    f"Time (s), I (A.U.), Q (A.U.)"
+                )
+
+                if script_test:
+                    conn.send( ('test', f'') )
+                else:
+                    conn.send(('Open', ''))
+
+                    while True:
+                        if conn.poll():
+                            msg = conn.recv()
+                            if msg.startswith('FL'):
+                                file_data = msg[2:]
+                                break
+                        general.wait('200 ms')
+
+                    file_handler.save_data(file_data, np.c_[x_axis_plot, data[0], data[1]], header = header, mode = 'w')
+
+                    conn.send( ('', f'Experiment {EXP_NAME} finished') )
+
+        except BaseException as e:
+            exc_info = f"{type(e)} \n{str(e)} \n{traceback.format_exc()}"
+            conn.send( ('Error', exc_info) )
+        finally:
+            # Always release the FPGA card, on every exit path (normal, Stop, or
+            # exception). The card can only be freed by this process, so this is
+            # the last line of defence against leaving it in an open state.
+            try:
+                pb.pulser_close()
+            except Exception:
+                pass
+
+def main():
+    """
+    A function to run the main window of the programm.
+    """
+    app = QApplication(sys.argv)
+    from atomize.general_modules.gui_style import apply_app_style
+    apply_app_style(app, app_id='Atomize.ITC.Phasing', desktop='rect')
+    main = MainWindow()
+    main.show()
+    # Optional preset path (e.g. from the Sequence Calculator's one-click open).
+    # argv[1] == 'test' is reserved for the script-side test mode, so skip it.
+    if len(sys.argv) > 1 and sys.argv[1] not in ('', 'test') and os.path.isfile(sys.argv[1]):
+        main.open_file(sys.argv[1])
+    sys.exit(app.exec())
+
+if __name__ == '__main__':
+    main()

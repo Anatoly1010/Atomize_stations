@@ -11,3 +11,4 @@ python3 -m pip install -e path/to/Atomize_stations/itc
 | Folder | Station | Command |
 | --- | --- | --- |
 | `itc/` | ITC EPR endstation | `atomize-itc`, `epr-auto` |
+| `itc2/` | ITC2 CW/TR EPR spectrometer (PC `itc22`) | `atomize-itc2`, `epr-auto` |

@@ -1,0 +1,46 @@
+.idea
+__pycache__/
+atomize/device_modules/config/__pycache__/
+atomize/device_modules/config/__pycache__
+*.pyc
+*.swo
+*~
+build
+dist
+*.egg-info
+atomize/logos
+atomize/device_modules/Metrolab_PT2025.py
+atomize/device_modules/config/Metrolab_PT2025_config.ini
+atomize/temp.param
+atomize/temp.csv
+libs/exam_adc.ini
+libs/exam_edac.ini
+libs/status
+libs/treatment_buffer.csv
+libs/treatment_lastdir.txt
+libs/excitation_lastdir.txt
+libs/script_lastdir.txt
+libs/data_lastdir.txt
+libs/cw_lastdir.txt
+libs/tr_lastdir.txt
+libs/tune_lastdir.txt
+libs/phase_lastdir.txt
+libs/phase_awg_lastdir.txt
+libs/phase_cor_lastdir.txt
+libs/spin_dynamics_lastdir.txt
+libs/liveplot_layout.txt
+*.param
+
+# epr_auto user preset space: user-saved presets are local (README stays tracked)
+atomize/epr_auto/presets/*.phase_awg
+atomize/epr_auto/presets/*.phase
+# epr_auto runtime output when protocols run from protocols/
+protocols/tuned/
+protocols/runs/
+# Claude Code: per-machine settings stay local; .claude/agents/ IS tracked
+.claude/settings.local.json
+/docs/INSYS_PROTECTION_REVIEW.md
+/docs/INSYS_LIVE_SNAPSHOT.md
+/docs/PHASING_TRACK.md
+/docs/automation/OUTPUT_PANEL.md
+/docs/tr_epr/SCOPE_TABS_LIVE_PLAN.md

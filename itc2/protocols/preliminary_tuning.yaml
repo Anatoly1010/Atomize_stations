@@ -1,0 +1,62 @@
+# Dry-run: python3 -m atomize.epr_auto run protocols/preliminary_tuning.yaml --test
+sample: test_sample
+autonomy: supervised
+notify: none
+
+# Set the sample, synthesizer bounds and field range for the experiment.
+steps:
+  # Built-in sequences; both IF values must match the later echo preset.
+  - tune.ringing_check:
+      if_mhz: 50
+      pulse_length: 102.4 ns
+  # Optional:
+  #     done: true
+  # Optional: omit this step to keep the current synthesizer frequency.
+  - tune.resonator:
+      if_mhz: 50
+      start_mhz: 9200
+      end_mhz: 9600
+      step_mhz: 1
+  # Optional: an absolute synthesizer frequency instead of the resonator scan.
+  # - bridge.set:
+  #     frequency_mhz: 9440
+  - tune.find_echo:
+      preset: hahn_echo_4s.phase_awg
+      center: 3445 G
+      span: 100 G
+      attenuation_db: 10
+      # RV approach: 60, 40, 20, 15, 10, 5, 0 dB, ending at attenuation_db.
+      # False keeps the current VA settings; later tuning steps inherit it.
+      adjust_video: true
+      # Optional repetition rate in Hz, up to 10000; otherwise use the preset.
+      # rep_rate: 1000
+      # Positive shifts the echo frequency above the resonator center.
+      frequency_shift_mhz: 0
+      # Target pi length; every echo pulse takes it, pi differs from pi/2 only in amplitude.
+      pulse_length: 22.4 ns
+      points: 41
+  - tune.rep_rate:
+      preset: hahn_echo_4s.phase_awg
+      mode: quantitative
+      rate_min: 10
+      rate_max: 2000
+  - tune.maximize_echo:
+      preset: hahn_echo_4s.phase_awg
+      rep_rate: auto
+      # pi/2 amplitude a in %, pi at 2a; the optimum must lie inside the range.
+      amplitude_range: [5, 50]
+      coarse_step: 5
+      fine_step: 1
+      field_span: 10 G
+      points: 21
+      pulse_map: {P2: pi2, P3: pi}
+  - tune.video_attenuation:
+      preset: hahn_echo_4s.phase_awg
+  # Publishes preset copies + fine_tuning.yaml to publish_dir (default
+  # <protocol dir>/tuned, overwritten each run); the handoff run's own output goes to <protocol dir>/runs/.
+  - tune.save_presets:
+      preset: hahn_echo_4s.phase_awg
+      calibration_preset: ampl_4s.phase_awg
+      field_preset: ed_4s.phase_awg
+      # Rabi pulse length for the fine calibration; omitted, so the preliminary length is used.
+      # calibration_length: 16 ns

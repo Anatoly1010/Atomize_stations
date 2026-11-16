@@ -78,6 +78,23 @@ spectrometer PC only `~/sources/Atomize_ITC` exists (no plain Atomize, no `atomi
 To continue, open Claude Code in `Atomize_stations/itc` and say: "Continue the station migration
 from `docs/stations/ROADMAP.md`, Resume here."
 
+## ITC2 station (2026-11-16)
+
+`itc2/` is the CW/TR EPR spectrometer on the PC `itc22` (`itc22@192.168.2.20`, no internet). It was
+built from `itc/` plus what that PC ran from `~/Atomize_ITC` (branch `cw-setup`, `4ac0277`, local
+commits on top of `f4578be`): its `cw_control.py` (SR-830, ITC_FC, this setup's BDPA and NMR
+numbers), its `config.ini`, `ITC_FC_config.ini` and `SR_830_config.ini`. App name and command
+`atomize-itc2`, package `atomize-itc2`; `docs/stations/` is not copied. The PC's ITC_FC PID set and
+the Sibir_1 register read (from its branch `backup/local-setup-2026-11-02`) went into the core.
+The PC's pulser configs (`PB_*`) in its user copy are old and not in use, so `itc2/` keeps `itc/`'s.
+
+On the PC: core and stations cloned from bundles into `~/sources/`, installed with `pip --user`
+(editable, `--no-deps`, build tools from wheels in `~/sources/wheels`); PyQt6 6.4.2 → 6.12.1
+from wheels (6.4.2 kept in `~/sources/wheels/qt642`), pyqtgraph stays 0.13.1; core and station
+`pytest` pass there. `~/.config/atomize-itc` copied to `~/.config/atomize-itc2`; desktop launcher
+installed. The old setup (`~/Atomize`, `~/Atomize_ITC`, the backups, `~/pyqtgragh`) is archived in
+`~/sources/old_setup_backup_2026_11_16.tar.gz`; `~/Atomize_ITC` is untouched.
+
 ## Goal
 
 - **`Atomize`** stays the public core, with no station code.

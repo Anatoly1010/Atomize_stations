@@ -1,0 +1,1322 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+from atomize.general_modules.gui_style import REFINED_STYLES, style_file_dialog
+import time
+import numpy as np
+from multiprocessing import Process, Pipe
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QLabel, QDoubleSpinBox, QSpinBox, QComboBox, QPushButton, QTextEdit, QGridLayout, QFrame, QCheckBox, QProgressBar, QFileDialog,  QTreeView, QHeaderView, QSizeGrip, QLineEdit, QFileIconProvider
+from PyQt6.QtGui import QIcon, QAction
+from PyQt6.QtCore import Qt, QTimer
+import atomize.general_modules.csv_opener_saver as openfile
+import atomize.general_modules.last_dir as ldir
+import atomize.control_center.field_param as field_param
+import atomize.control_center.temp_param as temp_param
+from atomize.general_modules.gui_style import CHECKBOX_STYLE
+
+# a repetition map is only worth drawing once it has some rows
+REP_PLOT_MIN = 5
+# BDPA calibration 2026-11-03 at 100 kHz: modulation G (peak-to-peak) per lock-in V, phase, wait per point in time constants
+MOD_G_PER_V = 0.675
+LOCK_IN_PHASE = 323.5
+TC_WAIT = 5
+# NMR gaussmeter 2026-08, (ITC setpoint, true field) in G; a quadratic through them maps true field to setpoint
+FIELD_NMR = ((1500, 1485.5993), (3500, 3466.7332), (4500, 4456.1467))
+FIELD_C2, FIELD_C1, FIELD_C0 = np.polyfit(*zip(*FIELD_NMR), 2)
+
+
+class MainWindow(QMainWindow):
+    """
+    A main window class
+    """
+    def __init__(self, *args, **kwargs):
+        """
+        A function for connecting actions and creating a main window
+        """
+        super(MainWindow, self).__init__(*args, **kwargs)
+        self.menu()
+
+        self.two_side = 0
+        self.rep_mode = 0
+        self.save_hdf5 = 0
+        self.field_cal = 1
+        self.design()
+        self.exit_clicked = 0
+        self.stop_requested = False
+        """
+        Create a process to interact with an experimental script that will run on a different thread.
+        We need a different thread here, since PyQt GUI applications have a main thread of execution that runs the event loop and GUI. If you launch a long-running task in this thread, then your GUI will freeze until the task terminates. During that time, the user won’t be able to interact with the application
+        """       
+        
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.check_messages)
+        self.monitor_timer = QTimer()
+        self.monitor_timer.timeout.connect(self.check_process_status)
+        self.rep_timer = QTimer()
+        self.rep_timer.timeout.connect(self.rep_countdown)
+        self.file_handler = openfile.Saver_Opener()
+
+        self.rep_active = 0
+        self.rep_index = 0
+        self.rep_remaining = 0
+        self.rep_continue = 0
+        self.rep_path = ''
+        self.rep_t0 = 0.0
+
+    def design(self):
+
+        self.setObjectName("MainWindow")
+        self.setWindowTitle("CW EPR")
+        self.setStyleSheet(REFINED_STYLES['WINDOW_STYLE'])
+
+        path_to_main = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(path_to_main, 'gui/icon_cw.ico')
+        self.setWindowIcon( QIcon(icon_path) )
+        self.path = os.path.join(path_to_main, '..', '..', '..', '..', 'experimental_data')
+
+        centralwidget = QWidget(self)
+        self.setCentralWidget(centralwidget)
+
+        gridLayout = QGridLayout()
+        gridLayout.setContentsMargins(15, 10, 10, 10)
+        gridLayout.setVerticalSpacing(4)
+        gridLayout.setHorizontalSpacing(20)
+
+        centralwidget.setLayout(gridLayout)
+
+
+        # ---- Labels & Inputs ----
+        labels = [("Start Field", "label_1"), ("End Field", "label_2"), ("Field Step", "label_3"), ("Lock In Amplitude", "label_4"), ("Lock In Time Constant", "label_5"), ("Lock In Sensitivity", "label_6"), ("Number of Scans", "label_7"), ("Two-Side Measurement", "label_8"), ("Experiment Name", "label_9"), ("Curve Name", "label_10"), ("Progress", "label_11"), ("Repetition Delay", "label_12"), ("Repetitive Mode", "label_13"), ("Next Run In", "label_14"), ("Save as HDF5", "label_15"), ("Field Calibration", "label_16")]
+
+        for name, attr_name in labels:
+            lbl = QLabel(name)
+            lbl.setFixedSize(190, 26)
+            setattr(self, attr_name, lbl)
+            lbl.setStyleSheet(REFINED_STYLES['LABEL_STYLE'])
+
+
+        # ---- Boxes ----
+        double_boxes = [(QDoubleSpinBox, "box_st_field", "cur_start_field", self.st_field, 0, 15000, 3000, 1, 1, " G"),
+                      (QDoubleSpinBox, "box_end_field", "cur_end_field", self.end_field, 0, 15000, 4000, 1, 1, " G"),
+                      (QDoubleSpinBox, "box_step_field", "cur_step", self.step_field, 0.01, 50, 0.5, 0.1, 2, " G"),
+                      (QDoubleSpinBox, "box_lock_ampl", "cur_lock_ampl", self.lock_ampl, 0.004, 5.0, 2.0, 0.1, 3, " V"),
+                      (QSpinBox, "box_scan", "cur_scan", self.scan, 1, 100, 1, 1, 0, ""),
+                      (QSpinBox, "box_rep_delay", "cur_rep_delay", self.rep_delay, 1, 86400, 60, 1, 0, " s")
+                        ]
+
+        for widget_class, attr_name, par_name, func, v_min, v_max, cur_val, v_step, dec, suf in double_boxes:
+            spin_box = widget_class()
+            if isinstance(spin_box, QDoubleSpinBox):
+                spin_box.setRange(v_min, v_max)
+                spin_box.setStyleSheet(REFINED_STYLES['COMPACT_FIELD_STYLE'])
+            else:
+                spin_box.setRange(int(v_min), int(v_max))
+                spin_box.setStyleSheet(REFINED_STYLES['COMPACT_FIELD_STYLE'])
+            spin_box.setSingleStep(v_step)
+            spin_box.setValue(cur_val)
+            if isinstance(spin_box, QDoubleSpinBox):
+                spin_box.setDecimals(dec)
+            spin_box.setSuffix(suf)
+            spin_box.valueChanged.connect(func)
+            spin_box.setFixedSize(130, 26)
+            spin_box.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.PlusMinus)
+            spin_box.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+
+            spin_box.setKeyboardTracking( False )
+            
+            setattr(self, attr_name, spin_box)
+            if isinstance(spin_box, QDoubleSpinBox):
+                setattr(self, par_name, float(spin_box.value()))
+            else:
+                setattr(self, par_name, int(spin_box.value()))
+
+
+        # ---- Combo boxes----
+        combo_boxes = [("30 ms", "combo_tc", "cur_tc", self.lock_tc, 
+                        [
+                        "1 s", "300 ms", "100 ms", "30 ms", "10 ms",
+                        "3 ms", "1 ms", "300 us", "100 us", "30 us",
+                        "10 us"
+                        ]),
+                      ("200 mV", "combo_sens", "cur_sens", self.lock_sens, 
+                        [
+                        "1 V", "500 mV", "200 mV", "100 mV", "50 mV",
+                        "20 mV", "10 mV", "5 mV", "2 mV", "1 mV",
+                        "500 uV", "200 uV", "100 uV"
+                        ])
+                      ]
+
+        for cur_text, attr_name, par_name, func, item in combo_boxes:
+            combo = QComboBox()
+            setattr(self, attr_name, combo)
+            setattr(self, par_name, combo.currentText())
+            combo.currentIndexChanged.connect(func)
+            combo.addItems(item)
+            combo.setCurrentText(cur_text)
+            combo.setFixedSize(130, 26)
+            combo.setStyleSheet(REFINED_STYLES['COMBO_STYLE'])
+
+        # ---- Text Edits ----
+        text_edit = [("CW", "text_edit_exp_name", "cur_exp_name", self.exp_name),
+                     ("exp1", "text_edit_curve", "cur_curve_name", self.curve_name)
+                    ]
+
+        for text, attr_name, par_name, func in text_edit:
+            txt = QTextEdit(text)
+            setattr(self, attr_name, txt)
+            setattr(self, par_name, txt.toPlainText())
+            txt.textChanged.connect(func)
+            txt.setFixedSize(130, 26)
+            txt.setAcceptRichText(False)
+            txt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            txt.setStyleSheet(REFINED_STYLES['COMPACT_TEXT_STYLE'])
+            txt.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+
+        # ---- Check Boxes ----
+        check_boxes = [("checkbox_back_scan", self.two_side_measure),
+                       ("checkbox_repeat", self.repeat_mode),
+                       ("checkbox_hdf5", self.hdf5_mode),
+                       ("checkbox_field_cal", self.field_cal_mode)]
+
+        for attr_name, func in check_boxes:
+            check = QCheckBox("")
+            setattr(self, attr_name, check)
+            check.stateChanged.connect(func)
+            check.setStyleSheet(CHECKBOX_STYLE)
+
+        # ---- Buttons ----
+        buttons = [("Start", "button_start", self.start),
+                   ("Stop", "button_stop", self.stop),
+                   ("Exit", "button_off", self.turn_off) ]
+
+        for name, attr_name, func in buttons:
+            btn = QPushButton(name)
+            btn.setFixedSize(140, 40)
+            btn.clicked.connect(func)
+            btn.setStyleSheet(REFINED_STYLES['BUTTON_STYLE'])
+            setattr(self, attr_name, btn)
+
+
+        # ---- Separators ----
+        def hline():
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setFrameShadow(QFrame.Shadow.Sunken)
+            line.setLineWidth(2)
+            return line
+
+        # ---- Progress Bar ----
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedSize(130, 15)
+        self.progress_bar.setTextVisible(True)
+        #self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        bar_style = REFINED_STYLES['PROGRESS_STYLE']
+
+        self.progress_bar.setStyleSheet(bar_style)
+
+        self.rep_progress_bar = QProgressBar()
+        self.rep_progress_bar.setRange(0, 100)
+        self.rep_progress_bar.setValue(0)
+        self.rep_progress_bar.setFixedSize(130, 15)
+        self.rep_progress_bar.setTextVisible(True)
+        self.rep_progress_bar.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.rep_progress_bar.setFormat("%v s")
+        self.rep_progress_bar.setStyleSheet(bar_style)
+
+        # ---- Layout placement ----
+        gridLayout.addWidget(self.label_1, 0, 0)
+        gridLayout.addWidget(self.box_st_field, 0, 1)
+        gridLayout.addWidget(self.label_2, 1, 0)
+        gridLayout.addWidget(self.box_end_field, 1, 1)
+        gridLayout.addWidget(self.label_3, 2, 0)
+        gridLayout.addWidget(self.box_step_field, 2, 1)
+        gridLayout.addWidget(self.label_16, 3, 0)
+        gridLayout.addWidget(self.checkbox_field_cal, 3, 1)
+        self.checkbox_field_cal.setCheckState(Qt.CheckState.Checked)
+
+        gridLayout.addWidget(hline(), 4, 0, 1, 2)
+
+        gridLayout.addWidget(self.label_4, 5, 0)
+        gridLayout.addWidget(self.box_lock_ampl, 5, 1)
+        self.lock_ampl()
+
+        gridLayout.addWidget(self.label_5, 6, 0)
+        gridLayout.addWidget(self.combo_tc, 6, 1)
+
+        gridLayout.addWidget(self.label_6, 7, 0)
+        gridLayout.addWidget(self.combo_sens, 7, 1)
+
+        gridLayout.addWidget(hline(), 8, 0, 1, 2)
+
+        gridLayout.addWidget(self.label_7, 9, 0)
+        gridLayout.addWidget(self.box_scan, 9, 1)
+        gridLayout.addWidget(self.label_8, 10, 0)
+        gridLayout.addWidget(self.checkbox_back_scan, 10, 1)
+
+        gridLayout.addWidget(hline(), 11, 0, 1, 2)
+
+        gridLayout.addWidget(self.label_9, 12, 0)
+        gridLayout.addWidget(self.text_edit_exp_name, 12, 1)
+        gridLayout.addWidget(self.label_10, 13, 0)
+        gridLayout.addWidget(self.text_edit_curve, 13, 1)
+
+        gridLayout.addWidget(hline(), 14, 0, 1, 2)
+
+        gridLayout.addWidget(self.label_11, 15, 0)
+        gridLayout.addWidget(self.progress_bar, 15, 1)
+
+        gridLayout.addWidget(hline(), 16, 0, 1, 2)
+
+        gridLayout.addWidget(self.label_12, 17, 0)
+        gridLayout.addWidget(self.box_rep_delay, 17, 1)
+        gridLayout.addWidget(self.label_13, 18, 0)
+        gridLayout.addWidget(self.checkbox_repeat, 18, 1)
+        gridLayout.addWidget(self.label_14, 19, 0)
+        gridLayout.addWidget(self.rep_progress_bar, 19, 1)
+        gridLayout.addWidget(self.label_15, 20, 0)
+        gridLayout.addWidget(self.checkbox_hdf5, 20, 1)
+
+        gridLayout.addWidget(hline(), 21, 0, 1, 2)
+
+        gridLayout.addWidget(self.button_start, 22, 0)
+        gridLayout.addWidget(self.button_stop, 23, 0)
+        gridLayout.addWidget(self.button_off, 24, 0)
+
+
+        gridLayout.setRowStretch(25, 2)
+        gridLayout.setColumnStretch(19, 2)
+
+    def menu(self):
+        menubar = self.menuBar()
+        menubar.setStyleSheet(REFINED_STYLES['MENU_STYLE'])
+        file_menu = menubar.addMenu("File")
+
+        menubar.setFixedHeight(27)
+
+        self.action_read = QAction("Read from file", self)
+        self.action_read.triggered.connect( self.open_file_dialog )
+        file_menu.addAction(self.action_read)
+
+        self.action_save = QAction("Save to file", self)
+        self.action_save.triggered.connect(self.save_file_dialog)
+        file_menu.addAction(self.action_save)
+
+    def two_side_measure(self):
+        """
+        Turn on/off backward measurement
+        """
+        if self.checkbox_back_scan.checkState().value == 2: # checked
+            self.two_side = 1
+        elif self.checkbox_back_scan.checkState().value == 0: # unchecked
+            self.two_side = 0
+
+    def field_cal_mode(self):
+        """
+        Turn on/off the NMR field calibration; read when Start is pressed
+        """
+        self.field_cal = 1 if self.checkbox_field_cal.checkState().value == 2 else 0
+
+    def repeat_mode(self):
+        """
+        Turn on/off repetitive measurement. The state is read once, when Start
+        is pressed; toggling it during a running series has no effect.
+        """
+        if self.checkbox_repeat.checkState().value == 2: # checked
+            self.rep_mode = 1
+        elif self.checkbox_repeat.checkState().value == 0: # unchecked
+            self.rep_mode = 0
+
+    def hdf5_mode(self):
+        """
+        Turn on/off saving in the HDF5 format
+        """
+        if self.checkbox_hdf5.checkState().value == 2: # checked
+            self.save_hdf5 = 1
+        elif self.checkbox_hdf5.checkState().value == 0: # unchecked
+            self.save_hdf5 = 0
+
+    def rep_delay(self):
+        """
+        A function to send a delay between two repetitions
+        """
+        self.cur_rep_delay = int( self.box_rep_delay.value() )
+
+    def start_rep_countdown(self):
+        """
+        A function to start counting down to the next repetition
+        """
+        self.rep_remaining = self.cur_rep_delay
+        self.rep_progress_bar.setRange(0, self.cur_rep_delay)
+        self.rep_progress_bar.setValue( self.rep_remaining )
+        self.rep_timer.start(1000)
+
+    def stop_rep_countdown(self):
+        """
+        A function to cancel a running countdown
+        """
+        self.rep_timer.stop()
+        self.rep_progress_bar.setValue(0)
+
+    def rep_countdown(self):
+        """
+        A function to update the countdown and to launch the next repetition
+        """
+        self.rep_remaining = self.rep_remaining - 1
+        self.rep_progress_bar.setValue( max(0, self.rep_remaining) )
+
+        if self.rep_remaining <= 0:
+            self.rep_timer.stop()
+            self.rep_index = self.rep_index + 1
+            self.rep_continue = 1
+            self.start()
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.turn_off()
+
+    def curve_name(self):
+        self.cur_curve_name = self.text_edit_curve.toPlainText()
+        #print( self.cur_curve_name )
+
+    def exp_name(self):
+        self.cur_exp_name = self.text_edit_exp_name.toPlainText()
+        #print( self.cur_exp_name )
+
+    def end_field(self):
+        """
+        A function to send an end field value
+        """
+        self.cur_end_field = round( float( self.box_end_field.value() ), 3 )
+        #print(self.cur_end_field)
+
+    def st_field(self, value):
+        """
+        A function to send a start field value
+        """
+        self.cur_start_field = round( float( value ), 3 )
+        #print(self.cur_start_field)
+
+    def step_field(self):
+        """
+        A function to send a step field value
+        """
+        self.cur_step = round( float( self.box_step_field.value() ), 3 )
+        #print(self.cur_step)
+
+    def lock_ampl(self):
+        """
+        A function to send a lock in amplitude value
+        """
+        self.cur_lock_ampl = round( float( self.box_lock_ampl.value() ), 3 )
+        if hasattr(self, 'label_4'):
+            self.label_4.setText(f'Lock In Amplitude ({self.cur_lock_ampl * MOD_G_PER_V:.2f} G)')
+        #print(self.cur_lock_ampl)
+
+    def scan(self):
+        """
+        A function to send a number of scans
+        """
+        self.cur_scan = int( self.box_scan.value() )
+        #print(self.cur_scan)
+        try:
+            self.parent_conn.send( 'SC' + str( self.cur_scan ) )
+        except AttributeError:
+            pass
+            #self.message('Experimental script is not running')
+
+    def lock_tc(self):
+        """
+        A function to send time constant
+        """
+        self.cur_tc = self.combo_tc.currentText()
+        #print( self.cur_tc )
+
+    def lock_sens(self):
+        """
+        A function to send sensitivity
+        """
+        self.cur_sens = self.combo_sens.currentText()
+        #print( self.cur_sens )
+    
+    def turn_off(self):
+        """
+         A function to turn off a program.
+        """
+        self.exit_clicked = 1
+        self.stop_requested = True
+        self.rep_active = 0
+        self.stop_rep_countdown()
+
+        try:
+            self.parent_conn.send( 'exit' )
+            self.monitor_timer.start(200)
+        except (AttributeError, BrokenPipeError, OSError):
+            sys.exit()
+            #self.message('Experimental script is not running')
+
+    def parse_message(self):
+        msg_type, data = self.parent_conn.recv()
+            
+        if msg_type == 'Status':
+            self.progress_bar.setValue(int(data))
+        elif msg_type == 'Open':
+            self.open_dialog()
+        elif msg_type == 'Error':
+            self.last_error = True
+            self.timer.stop()
+            self.progress_bar.setValue(0)
+            if msg_type != 'test':
+                self.message(data)
+            self.button_start.setStyleSheet(REFINED_STYLES['BUTTON_STYLE'])
+        else:
+            self.timer.stop()
+            self.progress_bar.setValue(0)
+            if msg_type != 'test':
+                self.message(data)
+                self.button_start.setStyleSheet(REFINED_STYLES['BUTTON_STYLE'])
+
+    def check_messages(self):
+
+        if not hasattr(self, 'last_error'):
+            self.last_error = False
+
+        while self.parent_conn.poll():
+            try:
+                self.parse_message()
+
+            except EOFError:
+                self.timer.stop()
+                break
+            except Exception as e:
+                # never swallow silently: surface the failure in the TextEdit
+                import traceback
+                self.errors.appendPlainText('GUI message-pump error:\n' + traceback.format_exc())
+                break
+
+        if self.exp_process.is_alive() and not self.timer.isActive():
+            self.exp_process.join()
+
+        if hasattr(self, 'exp_process') and not self.exp_process.is_alive():
+            if self.parent_conn.poll():
+                #return
+                self.parse_message()
+
+            self.timer.stop()
+
+            if getattr(self, 'is_testing', False):
+                self.is_testing = False
+                if not self.last_error and not self.stop_requested and not self.exit_clicked:
+                    self.last_error = False 
+                    time.sleep(0.1)
+                    self.run_main_experiment()
+                else:
+                    self.progress_bar.setValue(0)
+                    self.button_start.setStyleSheet(REFINED_STYLES['BUTTON_STYLE'])
+                    self.last_error = False
+                    field_param.clear_lock()
+                    temp_param.clear_lock()
+            else:
+                field_param.clear_lock()
+                temp_param.clear_lock()
+                self.button_start.setStyleSheet(REFINED_STYLES['BUTTON_STYLE'])
+
+                if self.rep_active == 1 and not self.last_error and self.exit_clicked == 0:
+                    self.start_rep_countdown()
+
+                self.last_error = False
+
+    def check_process_status(self):
+        if self.exp_process.is_alive():
+            return
+        
+        self.monitor_timer.stop()
+        self.exp_process.join()
+        #self.timer.stop()
+        self.progress_bar.setValue(0)
+        self.button_start.setStyleSheet(REFINED_STYLES['BUTTON_STYLE'])
+        field_param.clear_lock()
+        temp_param.clear_lock()
+
+        if self.exit_clicked == 1:
+            sys.exit()
+
+    def stop(self):
+        """
+        A function to stop script
+        """
+        self.stop_requested = True
+        self.rep_active = 0
+        self.stop_rep_countdown()
+
+        try:
+            self.parent_conn.send( 'exit' )
+            self.monitor_timer.start(200)
+
+        # the pipe is already closed when a countdown is stopped
+        except (AttributeError, BrokenPipeError, OSError):
+            pass
+            #self.message('Experimental script is not running')
+   
+    def start(self):
+        """
+        Button Start; Run function script(pipe_addres, four parameters of the experimental script)
+        from Worker class in a different thread
+        Create a Pipe for interaction with this thread
+        self.param_i are used as parameters for script function
+        """
+        worker = Worker()
+
+        # prevent running two processes
+        try:
+            if self.exp_process.is_alive() == True:
+                return
+        except AttributeError:
+            pass
+
+        self.stop_rep_countdown()
+
+        # a manual Start always opens a new series
+        if self.rep_continue == 0:
+            self.rep_index = 0
+            self.rep_path = ''
+            self.rep_t0 = time.time()
+
+        self.rep_continue = 0
+        self.rep_active = self.rep_mode
+
+        # a series is asked for its file up front, so it can run unattended
+        if self.rep_active == 1 and self.rep_path == '':
+            if self.ask_series_file() == 0:
+                return
+
+        if self.cur_start_field >= self.cur_end_field:
+            self.cur_start_field, self.cur_end_field = self.cur_end_field, self.cur_start_field
+
+            self.box_end_field.setValue( self.cur_end_field )
+            self.box_st_field.setValue( self.cur_start_field )
+
+        self.stop_requested = False
+        self.last_error = False
+        self.parent_conn, self.child_conn = Pipe()
+        
+        self.exp_process = Process( target = worker.exp_test, args = ( self.child_conn, self.cur_curve_name, self.cur_exp_name, self.cur_end_field, self.cur_start_field, self.cur_step, self.cur_lock_ampl, self.cur_scan, self.cur_tc, self.cur_sens, self.two_side, self.field_cal, ) )
+
+        self.button_start.setStyleSheet(REFINED_STYLES['PRIMARY_BUTTON_STYLE'])
+        self.progress_bar.setValue(0)
+        
+        self.exp_process.start()
+        self.parent_conn.send('start')
+        field_param.set_lock('cw_control')
+        temp_param.set_lock('cw_control')
+        
+        self.is_testing = True
+        self.timer.start(200)
+
+    def run_main_experiment(self):
+
+        worker = Worker()
+        self.parent_conn, self.child_conn = Pipe()
+        
+        rep_info = ( self.rep_active, self.rep_index,
+                     round( time.time() - self.rep_t0, 3 ), self.cur_rep_delay,
+                     self.rep_path )
+
+        self.exp_process = Process(
+            target = worker.exp_on, 
+            args = (self.child_conn, self.cur_curve_name, self.cur_exp_name, 
+                  self.cur_end_field, self.cur_start_field, self.cur_step, 
+                  self.cur_lock_ampl, self.cur_scan, self.cur_tc, 
+                  self.cur_sens, self.two_side, rep_info, self.field_cal)
+        )
+        self.exp_process.start()
+        self.parent_conn.send('start')
+        self.timer.start(200)
+
+    def message(self, *text):
+        if len(text) == 1:
+            print(f'{text[0]}', flush=True)
+        else:
+            print(f'{text}', flush=True)
+
+    def ask_series_file(self):
+        """
+        A function to choose the file of a whole series before it starts.
+        Returns 0 when the dialog was cancelled and the series must not run.
+        """
+        file_data = self.file_handler.create_file_dialog(multiprocessing = True,
+            directory = ldir.load('cw', self.path),
+            fmt = 'h5' if self.save_hdf5 == 1 else 'csv')
+
+        if not file_data or file_data == 'None':
+            self.message('Repetitive measurement needs a file; nothing was started')
+            return 0
+
+        self.rep_path = str( file_data )
+        self.save_file( os.path.splitext( self.rep_path )[0] )
+        return 1
+
+    def open_dialog(self):
+        file_data = self.file_handler.create_file_dialog(multiprocessing = True,
+            directory = ldir.load('cw', self.path),
+            fmt = 'h5' if self.save_hdf5 == 1 else 'csv')
+        #print(file_data == 'None')
+        if file_data:
+            if file_data != 'None':
+                self.save_file( os.path.splitext( str( file_data ) )[0] )
+            self.parent_conn.send( 'FL' + str( file_data ) )
+        else:
+            self.parent_conn.send( 'FL' + '' )
+
+    def open_file_dialog(self):
+        """
+        A function to open a new window for choosing a pulse list
+        """
+        filedialog = QFileDialog(self, 'Open File', directory = ldir.load('cw', self.path), filter = "CW Parameters (*.cw)", options = QFileDialog.Option.DontUseNativeDialog)
+        filedialog.setMinimumWidth(800)
+
+        tree = filedialog.findChild(QTreeView)
+        header = tree.header()
+        for i in range(header.count()):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+
+        buttons = filedialog.findChildren(QPushButton)
+        seen_texts = []
+        for btn in buttons:
+            if btn.text() in seen_texts:
+                btn.hide()
+            else:
+                seen_texts.append(btn.text())
+        
+        line_edit = filedialog.findChild(QLineEdit)
+
+        if line_edit:
+            line_edit.setCompleter(None)
+
+        size_grip = filedialog.findChild(QSizeGrip)
+        if size_grip:
+            size_grip.setVisible(False)
+
+        style_file_dialog(filedialog)
+        
+        filedialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        filedialog.fileSelected.connect(self.open_file)
+        filedialog.show()
+
+    def save_file_dialog(self):
+        """
+        A function to open a new window for choosing a pulse list
+        """
+        filedialog = QFileDialog(self, 'Save File', directory = ldir.load('cw', self.path), filter = "CW Parameters (*.cw)", options = QFileDialog.Option.DontUseNativeDialog)
+        filedialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        filedialog.setMinimumWidth(800)
+        
+        tree = filedialog.findChild(QTreeView)
+        header = tree.header()
+        for i in range(header.count()):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+
+        buttons = filedialog.findChildren(QPushButton)
+        seen_texts = []
+        for btn in buttons:
+            if btn.text() in seen_texts:
+                btn.hide()
+            else:
+                seen_texts.append(btn.text())
+        
+        line_edit = filedialog.findChild(QLineEdit)
+
+        if line_edit:
+            line_edit.setCompleter(None)
+
+        size_grip = filedialog.findChild(QSizeGrip)
+        if size_grip:
+            size_grip.setVisible(False)
+
+        style_file_dialog(filedialog)
+
+        filedialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        filedialog.fileSelected.connect(self.save_file)
+        filedialog.show()
+
+    def open_file(self, filename):
+        """
+        A function to open a pulse list
+        :param filename: string
+        """
+        self.path = os.path.dirname(filename)
+        ldir.save('cw', self.path)
+        text = open(filename).read()
+        lines = text.split('\n')
+
+        self.box_st_field.setValue( float( lines[0].split(':  ')[1] ) )
+        self.box_end_field.setValue( float( lines[1].split(':  ')[1] ) )
+        self.box_step_field.setValue( float( lines[2].split(':  ')[1] ) )
+        self.box_lock_ampl.setValue( float( lines[3].split(':  ')[1] ) )
+        self.combo_tc.setCurrentText( str( lines[4].split(':  ')[1] ) )
+        self.combo_sens.setCurrentText( str( lines[5].split(':  ')[1] ) )
+        self.box_scan.setValue( int( lines[6].split(':  ')[1] ) )
+        if int( lines[7].split(':  ')[1] ) == 2:
+            self.checkbox_back_scan.setCheckState(Qt.CheckState.Checked)
+        else:
+            self.checkbox_back_scan.setCheckState(Qt.CheckState.Unchecked)
+
+        # presets written before repetitive measurement end here
+        if len( lines ) > 11:
+            self.box_rep_delay.setValue( int( lines[8].split(':  ')[1] ) )
+
+            if int( lines[9].split(':  ')[1] ) == 2:
+                self.checkbox_repeat.setCheckState(Qt.CheckState.Checked)
+            else:
+                self.checkbox_repeat.setCheckState(Qt.CheckState.Unchecked)
+
+            if int( lines[10].split(':  ')[1] ) == 2:
+                self.checkbox_hdf5.setCheckState(Qt.CheckState.Checked)
+            else:
+                self.checkbox_hdf5.setCheckState(Qt.CheckState.Unchecked)
+
+    def save_file(self, filename):
+        """
+        A function to save a new pulse list
+        :param filename: string
+        """
+        self.path = os.path.dirname(filename)
+        ldir.save('cw', self.path)
+        if filename[-2:] != 'cw':
+            filename = filename + '.cw'
+        with open(filename, 'w') as file:
+            file.write( 'Start Field:  ' + str(self.box_st_field.value()) + '\n' )
+            file.write( 'End Field:  ' + str(self.box_end_field.value()) + '\n' )
+            file.write( 'Field Step:  ' + str(self.box_step_field.value()) + '\n' )
+            file.write( 'Lock In Amplitude:  ' + str(self.box_lock_ampl.value()) + '\n' )
+            file.write( 'Lock In TC:  ' + str(self.combo_tc.currentText()) + '\n' )
+            file.write( 'Lock In Sensitivity:  ' + str(self.combo_sens.currentText()) + '\n' )
+            file.write( 'Scans:  ' + str(self.box_scan.value()) + '\n' )
+            file.write( 'Two-Side:  ' + str(self.checkbox_back_scan.checkState().value) + '\n' )
+            file.write( 'Repetition Delay:  ' + str(self.box_rep_delay.value()) + '\n' )
+            file.write( 'Repetitive Mode:  ' + str(self.checkbox_repeat.checkState().value) + '\n' )
+            file.write( 'Save as HDF5:  ' + str(self.checkbox_hdf5.checkState().value) + '\n' )
+
+# The worker class that run the digitizer in a different thread
+class Worker():
+    def __init__(self):
+        super(Worker, self).__init__()
+        # initialization of the attribute we use to stop the experimental script
+        self.command = 'start'
+
+    def save_series(self, file_handler, file_data, x_axis, data, header, rep_index, rep_time):
+        """
+        A function to store a repetitive measurement as one 2D dataset:
+        one row per repetition, one column per field point. Every repetition
+        reads back what the previous ones wrote and rewrites the whole matrix,
+        since each of them runs in its own process. For HDF5 the field axis and
+        the true elapsed time of every repetition are kept as axis vectors;
+        a CSV carries the same information as header resolution lines.
+        :param file_data: string
+        :param rep_index: int, zero-based position in the series
+        :param rep_time: float, seconds since the series started
+        """
+        matrix = np.atleast_2d( data )
+        sweep = np.array( [ rep_time ] )
+        is_h5 = str( file_data ).lower().endswith('.h5')
+
+        if rep_index > 0:
+            previous = np.atleast_2d( file_handler.open_2d( file_data )[1] )
+            matrix = np.vstack( (previous, matrix) )
+
+            if is_h5:
+                axes = file_handler.open_h5_axes( file_data )
+                sweep = np.append( axes.get( 'sweep', np.array([]) ), rep_time )
+
+        # a rewrite in place would lose the whole series if it were interrupted
+        base, ext = os.path.splitext( str( file_data ) )
+        tmp_name = base + '_tmp' + ext
+
+        file_handler.save_data(tmp_name, matrix, header = header, mode = 'w',
+            axes = ( x_axis, sweep ), axes_units = ( 'G', 's' ))
+        os.replace(tmp_name, file_data)
+
+        return matrix
+
+
+    def exp_on(self, conn, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11 = (0, 0, 0.0, 0, ''), p12 = 1):
+        """
+        function that contains experimental script
+        """
+        # [                1,                 2,                  3,                    4, ]
+        #self.cur_curve_name, self.cur_exp_name, self.cur_end_field, self.cur_start_field, 
+        # [          5,                 6,              7,           8,             9,     ]
+        #self.cur_step, self.cur_lock_ampl, self.cur_scan, self.cur_tc, self.cur_sens, 
+        #           10,         ]
+        #self.two_side,    
+        #                                                                      11,        ]
+        #(rep_active, rep_index, seconds since the series started, rep_delay, file of the series),
+
+        # should be inside dig_on() function;
+        # freezing after digitizer restart otherwise
+        import traceback
+
+        try:
+            import datetime
+            import atomize.general_modules.general_functions as general
+            import atomize.device_modules.SR_830 as sr
+            import atomize.device_modules.ITC_FC as itc
+            import atomize.general_modules.csv_opener_saver as openfile
+
+            file_handler = openfile.Saver_Opener()
+            sr830 = sr.SR_830()
+            itc_fc = itc.ITC_FC()
+            def set_field(b):
+                itc_fc.magnet_field( round( (-FIELD_C1 + np.sqrt(FIELD_C1**2 - 4 * FIELD_C2 * (FIELD_C0 - b))) / (2 * FIELD_C2), 3 ) if p12 else b )
+                return b
+
+            # parameters for initial initialization
+            field = p4
+            START_FIELD = p4
+            END_FIELD = p3
+            FIELD_STEP = p5
+            initialization_step = 10
+            SCANS = p7
+            process = 'None'
+            rep_active, rep_index, rep_time, rep_delay, rep_file = p11
+
+            #itc_fc.magnet_setup( 100, FIELD_STEP)
+
+            tc_wait = 0
+            raw = p8.split(" ")
+            if int( raw[0] ) > 100 or raw[1] == 's':
+                tc_wait = 1
+            wait_pt = f'{TC_WAIT * int( raw[0] )} {raw[1]}'
+
+            points = int( (END_FIELD - START_FIELD) / FIELD_STEP ) + 1
+            data = np.zeros(points)
+            x_axis = np.round( START_FIELD + FIELD_STEP * np.arange(points), 3 )
+
+            sr830.lock_in_time_constant( p8 )
+            sr830.lock_in_sensitivity( '1 V' )
+            sr830.lock_in_ref_amplitude( f'{p6} V' )
+            sr830.lock_in_phase( LOCK_IN_PHASE )
+            sr830.lock_in_ref_frequency( '100 kHz' )
+
+            
+            #START_FIELD = 3460.2
+            # the idea of automatic and dynamic changing is
+            # sending a new value of repetition rate via self.command
+            # in each cycle we will check the current value of self.command
+            # self.command = 'exit' will stop the digitizer
+            while self.command != 'exit':
+                # Start of experiment
+                while field < START_FIELD:
+                    field = set_field( field + initialization_step)
+                    field = START_FIELD
+
+                field = set_field( START_FIELD )
+                sr830.lock_in_sensitivity( p9 )
+
+                j = 1
+                while j <= SCANS:
+
+                    i = 0
+                    field = START_FIELD
+                    if p10 == 0:
+                        general.wait('2000 ms')
+                    elif p10 == 1:
+                        pass
+
+                    if self.command == 'exit':
+                        break
+
+                    while field <= END_FIELD:
+                        
+                        #if tc_wait == 1:
+                        general.wait( wait_pt )
+                            #general.wait('10 ms')
+
+                        if p10 == 0:
+                            data[i] = ( data[i] * (j - 1) + sr830.lock_in_get_data() ) / j
+                        elif p10 == 1:
+                            data[i] = ( data[i] * (2*j - 2) + sr830.lock_in_get_data() ) / (2*j - 1)
+
+                        if p10 == 0:
+                            conn.send( ('Status', int( 100 * ((j - 1) * points + i + 1) / points / SCANS)) )
+                        elif p10 == 1:
+                            conn.send( ('Status', int( 100 * ((2*j - 2) * points + i + 1) / points / SCANS / 2)) )
+
+                        process = general.plot_1d( p2, x_axis, data, xname = 'Field',
+                            xscale = 'G', yname = 'Intensity', yscale = 'V', label = p1, 
+                            text = 'Scan / Field: ' + str(j) + ' / ' + str(field), pr = process )
+
+                        field = round( (FIELD_STEP + field), 3 )
+                        set_field(field)
+
+                        # check our polling data
+                        if self.command[0:2] == 'SC':
+                            SCANS = int( self.command[2:] )
+                            self.command = 'start'
+                        elif self.command == 'exit':
+                            break
+                        
+                        if conn.poll() == True:
+                            self.command = conn.recv()
+
+                        i += 1
+
+                    if p10 == 0:
+                        if j != SCANS:
+                            while field > START_FIELD:
+                                field = set_field( field - initialization_step)
+                                field = field - initialization_step
+                            set_field( START_FIELD )
+
+                    elif p10 == 1:
+                        while field > START_FIELD:
+
+                            i -= 1
+                            #if tc_wait == 1:
+                            general.wait( wait_pt )
+                                #general.wait('10 ms')
+                            
+                            field = round( (-FIELD_STEP + field), 3 )
+                            set_field(field)
+                            
+                            conn.send( ('Status', int( 100 * ((2*j - 1) * points - i + points) / points / SCANS / 2)) )
+
+                            data[i] = ( data[i] * (2*j - 1) + sr830.lock_in_get_data() ) / (2*j)
+
+                            process = general.plot_1d( p2, x_axis, data, xname = 'Field',
+                                xscale = 'G', yname = 'Intensity', yscale = 'V', label = p1,
+                                text = 'Scan / Field: ' + str(j) + ' / ' + str(field), 
+                                pr = process )
+
+                            # check our polling data
+                            if self.command[0:2] == 'SC':
+                                SCANS = int( self.command[2:] )
+                                self.command = 'start'
+                            elif self.command == 'exit':
+                                break
+                            
+                            if conn.poll() == True:
+                                self.command = conn.recv()
+                    
+                    j += 1
+
+                # finish succesfully
+                self.command = 'exit'
+
+            if self.command == 'exit':
+                #general.message(f'Script {p2} finished')
+                sr830.lock_in_sensitivity( '1 V' )
+                now = datetime.datetime.now().strftime("%d-%m-%Y %H-%M-%S")
+                w = 30
+
+                # Data saving
+                header = (
+                    f"{'Date:':<{w}} {now}\n"
+                    f"{'Experiment:':<{w}} Continuous Wave EPR Spectrum\n"
+                    f"{'Start Field:':<{w}} {START_FIELD} G\n"
+                    f"{'End Field:':<{w}} {END_FIELD} G\n"
+                    f"{'Field Step:':<{w}} {FIELD_STEP} G\n"
+                    f"{'Number of Scans:':<{w}} {SCANS}\n"
+                    f"{'Time Constant:':<{w}} {p8}\n"
+                    f"{'Modulation Ampl:':<{w}} {p6} V ({round(p6 * MOD_G_PER_V, 3)} G)\n"
+                    f"{'Field Calibration:':<{w}} {f'NMR 2026-08, ITC vs true G {FIELD_NMR}' if p12 else 'off, ITC setpoint'}\n"
+                )
+
+                if rep_active == 1:
+                    # the mean period is exact once the series has two points
+                    if rep_index > 0:
+                        v_res = round( rep_time / rep_index, 3 )
+                    else:
+                        v_res = rep_delay
+
+                    header = (
+                        header +
+                        f"{'Repetitions:':<{w}} {rep_index + 1}\n"
+                        f"{'Repetition Delay:':<{w}} {rep_delay} s\n"
+                    )
+
+                    # data_treatment_2d zeroes the start of every axis it takes from
+                    # the header, so the field origin only survives in a stored vector
+                    if not str( rep_file ).lower().endswith('.h5'):
+                        header = header + f"{'Horizontal Resolution:':<{w}} {FIELD_STEP} G\n"
+
+                    header = (
+                        header +
+                        f"{'Vertical Resolution:':<{w}} {v_res} s\n"
+                        f"X (Field/G): start {START_FIELD} step {FIELD_STEP}\n"
+                        f"Y (Time/s): start 0 step {v_res}\n"
+                        f"{'-'*50}\n"
+                        f"Rows: repetitions, Columns: field (G)"
+                    )
+                else:
+                    header = header + f"{'-'*50}\n" + f"Field (G), X (V)"
+
+                if rep_active == 1 and rep_file != '':
+                    file_data = rep_file
+                else:
+                    conn.send(('Open', ''))
+
+                    while True:
+                        if conn.poll():
+                            msg = conn.recv()
+                            if msg.startswith('FL'):
+                                file_data = msg[2:]
+                                break
+                        general.wait('200 ms')
+
+                if rep_active == 1 and file_data != '' and file_data != 'None':
+                    matrix = self.save_series(file_handler, file_data, x_axis, data, header, rep_index, rep_time)
+
+                    if matrix.shape[0] >= REP_PLOT_MIN:
+                        general.plot_2d( p2 + ' 2D', np.transpose( matrix ),
+                            start_step = ( (START_FIELD, FIELD_STEP), (0, v_res) ),
+                            xname = 'Field', xscale = 'G', yname = 'Time', yscale = 's',
+                            zname = 'Intensity', zscale = 'V',
+                            text = 'Repetition: ' + str(rep_index + 1) )
+                else:
+                    file_handler.save_data(file_data, np.c_[x_axis, data], header = header, mode = 'w')
+
+                while field > START_FIELD:
+                    field = set_field( field - initialization_step )
+                    field = field - initialization_step 
+                set_field( START_FIELD )
+
+                conn.send( ('', f'Script {p2} finished') )
+                general.wait('200 ms')
+                conn.close()
+                
+        except BaseException as e:
+            exc_info = f"{type(e)} \n{str(e)} \n{traceback.format_exc()}"
+            conn.send( ('Error', exc_info) )
+
+    def exp_test(self, conn, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p12 = 1):
+        """
+        function that contains experimental script
+        """
+        # [                1,                 2,                  3,                    4, ]
+        #self.cur_curve_name, self.cur_exp_name, self.cur_end_field, self.cur_start_field, 
+        # [          5,                 6,              7,           8,             9,     ]
+        #self.cur_step, self.cur_lock_ampl, self.cur_scan, self.cur_tc, self.cur_sens, 
+        #           10,         ]
+        #self.two_side,    
+
+        # should be inside dig_on() function;
+        # freezing after digitizer restart otherwise
+        import traceback
+
+        sys.argv = ['', 'test']
+
+        try:
+            import datetime
+            import atomize.general_modules.general_functions as general
+            general.test_flag = 'test'
+            import atomize.device_modules.SR_830 as sr
+            import atomize.device_modules.ITC_FC as itc
+            import atomize.general_modules.csv_opener_saver as openfile
+
+            file_handler = openfile.Saver_Opener()
+            sr830 = sr.SR_830()
+            itc_fc = itc.ITC_FC()
+            def set_field(b):
+                itc_fc.magnet_field( round( (-FIELD_C1 + np.sqrt(FIELD_C1**2 - 4 * FIELD_C2 * (FIELD_C0 - b))) / (2 * FIELD_C2), 3 ) if p12 else b )
+                return b
+
+            # parameters for initial initialization
+            field = p4
+            START_FIELD = p4
+            END_FIELD = p3
+            FIELD_STEP = p5
+            initialization_step = 10
+            SCANS = p7
+            process = 'None'
+
+            #itc_fc.magnet_setup( 100, FIELD_STEP)
+
+            tc_wait = 0
+            raw = p8.split(" ")
+            if int( raw[0] ) > 100 or raw[1] == 's':
+                tc_wait = 1
+            wait_pt = f'{TC_WAIT * int( raw[0] )} {raw[1]}'
+
+            points = int( (END_FIELD - START_FIELD) / FIELD_STEP ) + 1
+            data = np.zeros(points)
+            x_axis = np.round( START_FIELD + FIELD_STEP * np.arange(points), 3 )
+
+            sr830.lock_in_time_constant( p8 )
+            sr830.lock_in_sensitivity( '1 V' )
+            sr830.lock_in_ref_amplitude( f'{p6} V' )
+            sr830.lock_in_phase( LOCK_IN_PHASE )
+            sr830.lock_in_ref_frequency( '100 kHz' )
+
+            
+            #START_FIELD = 3460.2
+            # the idea of automatic and dynamic changing is
+            # sending a new value of repetition rate via self.command
+            # in each cycle we will check the current value of self.command
+            # self.command = 'exit' will stop the digitizer
+            while self.command != 'exit':
+                # Start of experiment
+                while field < START_FIELD:
+                    field = set_field( field + initialization_step)
+                    field = START_FIELD
+
+                field = set_field( START_FIELD )
+                sr830.lock_in_sensitivity( p9 )
+
+                #j = 1
+                for j in general.scans(SCANS):
+
+                    i = 0
+                    field = START_FIELD
+                    if p10 == 0:
+                        general.wait('2000 ms')
+                    elif p10 == 1:
+                        pass
+
+                    if self.command == 'exit':
+                        break
+
+                    while field <= END_FIELD:
+                        
+                        #if tc_wait == 1:
+                        general.wait( wait_pt )
+                            #general.wait('10 ms')
+
+                        if p10 == 0:
+                            data[i] = ( data[i] * (j - 1) + sr830.lock_in_get_data() ) / j
+                        elif p10 == 1:
+                            data[i] = ( data[i] * (2*j - 2) + sr830.lock_in_get_data() ) / (2*j - 1)
+
+                        #if p10 == 0:
+                        #    conn.send( ('Status', int( 100 * ((j - 1) * points + i + 1) / points / SCANS)) )
+                        #elif p10 == 1:
+                        #    conn.send( ('Status', int( 100 * ((2*j - 2) * points + i + 1) / points / SCANS / 2)) )
+
+                        process = general.plot_1d( p2, x_axis, data, xname = 'Field',
+                            xscale = 'G', yname = 'Intensity', yscale = 'V', label = p1, 
+                            text = 'Scan / Field: ' + str(j) + ' / ' + str(field), pr = process )
+
+                        field = round( (FIELD_STEP + field), 3 )
+                        set_field(field)
+
+                        # check our polling data
+                        if self.command[0:2] == 'SC':
+                            SCANS = int( self.command[2:] )
+                            self.command = 'start'
+                        elif self.command == 'exit':
+                            break
+                        
+                        if conn.poll() == True:
+                            self.command = conn.recv()
+
+                        i += 1
+
+                    if p10 == 0:
+                        if j != SCANS:
+                            while field > START_FIELD:
+                                field = set_field( field - initialization_step)
+                                field = field - initialization_step
+                            set_field( START_FIELD )
+
+                    elif p10 == 1:
+                        while field > START_FIELD:
+
+                            i -= 1
+                            #if tc_wait == 1:
+                            general.wait( wait_pt )
+                                #general.wait('10 ms')
+                            
+                            field = round( (-FIELD_STEP + field), 3 )
+                            set_field(field)
+                            
+                            #conn.send( ('Status', int( 100 * ((2*j - 1) * points - i + points) / points / SCANS / 2)) )
+
+                            data[i] = ( data[i] * (2*j - 1) + sr830.lock_in_get_data() ) / (2*j)
+
+                            process = general.plot_1d( p2, x_axis, data, xname = 'Field',
+                                xscale = 'G', yname = 'Intensity', yscale = 'V', label = p1,
+                                text = 'Scan / Field: ' + str(j) + ' / ' + str(field), 
+                                pr = process )
+
+                            # check our polling data
+                            if self.command[0:2] == 'SC':
+                                SCANS = int( self.command[2:] )
+                                self.command = 'start'
+                            elif self.command == 'exit':
+                                break
+                            
+                            if conn.poll() == True:
+                                self.command = conn.recv()
+                    
+                    #j += 1
+
+                # finish succesfully
+                self.command = 'exit'
+
+            if self.command == 'exit':
+                #general.message(f'Script {p2} finished')
+                sr830.lock_in_sensitivity( '1 V' )
+                now = datetime.datetime.now().strftime("%d-%m-%Y %H-%M-%S")
+                w = 30
+
+                # Data saving
+                header = (
+                    f"{'Date:':<{w}} {now}\n"
+                    f"{'Experiment:':<{w}} Continuous Wave EPR Spectrum\n"
+                    f"{'Start Field:':<{w}} {START_FIELD} G\n"
+                    f"{'End Field:':<{w}} {END_FIELD} G\n"
+                    f"{'Field Step:':<{w}} {FIELD_STEP} G\n"
+                    f"{'Number of Scans:':<{w}} {SCANS}\n"
+                    f"{'Time Constant:':<{w}} {p8}\n"
+                    f"{'Modulation Ampl:':<{w}} {p6} V ({round(p6 * MOD_G_PER_V, 3)} G)\n"
+                    f"{'Field Calibration:':<{w}} {f'NMR 2026-08, ITC vs true G {FIELD_NMR}' if p12 else 'off, ITC setpoint'}\n"
+                    f"{'-'*50}\n"
+                    f"Field (G), X (V)"
+                )
+                
+                #conn.send(('Open', ''))
+                
+                #while True:
+                #    if conn.poll():
+                #        msg = conn.recv()
+                #        if msg.startswith('FL'):
+                #            file_data = msg[2:]
+                #            break
+                #    general.wait('200 ms')
+
+                #file_handler.save_data(file_data, np.c_[x_axis, data], header = header, mode = 'w')
+
+                while field > START_FIELD:
+                    field = set_field( field - initialization_step )
+                    field = field - initialization_step 
+                set_field( START_FIELD )
+
+                conn.send( ('test', f'Script {p2} finished') )
+                conn.close()
+
+        except BaseException as e:
+            exc_info = f"{type(e)} \n{str(e)} \n{traceback.format_exc()}"
+            conn.send( ('Error', exc_info) )
+
+def main():
+    """
+    A function to run the main window of the programm.
+    """
+    app = QApplication(sys.argv)
+    from atomize.general_modules.gui_style import apply_app_style
+    apply_app_style(app, app_id='Atomize.ITC.CWControl', desktop='cw')
+    main = MainWindow()
+    main.show()
+    sys.exit(app.exec())
+
+if __name__ == '__main__':
+    main()
