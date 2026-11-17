@@ -144,13 +144,13 @@ class MainWindow(QMainWindow):
 
 
         # ---- Combo boxes----
-        combo_boxes = [("30 ms", "combo_tc", "cur_tc", self.lock_tc, 
+        combo_boxes = [("10 ms", "combo_tc", "cur_tc", self.lock_tc, 
                         [
                         "1 s", "300 ms", "100 ms", "30 ms", "10 ms",
                         "3 ms", "1 ms", "300 us", "100 us", "30 us",
                         "10 us", "3 us", "1 us"
                         ]),
-                      ("200 mV", "combo_sens", "cur_sens", self.lock_sens, 
+                      ("50 mV", "combo_sens", "cur_sens", self.lock_sens, 
                         [
                         "1 V", "500 mV", "200 mV", "100 mV", "50 mV",
                         "20 mV", "10 mV", "5 mV", "2 mV", "1 mV",
