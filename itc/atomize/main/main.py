@@ -485,7 +485,7 @@ class MainExtended(MainWindow):
         self.protocol_launcher.options_layout.addWidget(self.checkTests)
         main_layout.addStretch()
 
-        bottom_label = QLabel("Version 0.4.0; 12/09/2026")
+        bottom_label = QLabel("Version 0.5.0; 17/11/2026")
         bottom_label.setStyleSheet(REFINED_STYLES['HINT_STYLE'])
         main_layout.addWidget(bottom_label)
 
