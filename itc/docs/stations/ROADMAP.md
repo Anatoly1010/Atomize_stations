@@ -1,9 +1,27 @@
 # Two repos instead of five — roadmap
 
-Created 2026-11-15. Status: Phases 1 to 3 done; Phase 4 (spectrometer PC) is next. This file moved here from
-`Atomize_ITC/docs/stations/`.
+Created 2026-11-15. Status: Phases 1 to 4 done (spectrometer PC on 2026-11-17); Phase 5 is next. This file moved here
+from `Atomize_ITC/docs/stations/`.
 
 ## Resume here
+
+State on 2026-11-17: the spectrometer PC (`fel2@192.168.2.1`, Ubuntu 22.04, Python 3.10, no internet)
+runs the new setup; CW, TR and pulsed mode work. Core `Atomize` `e16ea36` (BH_15 `max_set_retries`
+read from the config) and `Atomize_stations` `c67f565` (CW defaults 10 ms / 50 mV) are on the PC and
+not yet pushed. Details in Phase 4 below.
+
+- Install: venv `~/sources/atomize_venv`, created `--without-pip` (the box has no `python3-venv`);
+  pip, build tools and all packages from wheels in `~/sources/wheels` (PyQt6 6.12.1, numpy 2.2.6,
+  scipy 1.15.3, pyqtgraph 0.14.0). Core and station editable from `~/sources/Atomize` and
+  `~/sources/Atomize_stations`, cloned from bundles in `~/sources/bundles`. The linux-gpib binding
+  stays in `/usr/local`; `linux_gpib.pth` in the venv points at it.
+- `.bashrc`: `atom` and `epr` start the venv's `atomize-itc` and `epr-auto run`; `atom-pull` pulls
+  both repos from GitHub (`origin` = the public HTTPS URLs; the PC needs a network connection). The desktop launcher points at the venv.
+- `~/.config/atomize-itc` is kept as it was, plus `max_set_retries = 1` in `BH_15_config.ini` (the
+  box ran with a local code edit before). Device configs changed in a repo must be copied there by hand.
+- The old `~/sources/Atomize_ITC` and its user-site install are removed; the folder is in
+  `~/sources/Atomize_ITC_archive_2026_11_17.tar.gz`, the configs and runtime files of the day in
+  `~/sources/old_setup_backup_2026_11_17.tar.gz`. Plain `python3` has no `atomize` any more.
 
 State on 2026-11-15, end of session 2. Phases 1 to 3 are done, committed and pushed in every repo.
 
@@ -65,8 +83,8 @@ above must stay).
 
 Next, in order:
 
-1. Phase 4 on the spectrometer PC, following the install guide (`~/claude/atomize-itc-install.md`
-   on the development machine).
+1. Push `Atomize` `e16ea36` and `Atomize_stations` `c67f565`.
+2. Phase 5: a week of normal use; the hardware checks left open in Phase 4 D.
 
 Decisions made: station repo `Atomize_stations`, fresh history, branch `main`; `atomize-itc`
 starts at 0.5.0; this roadmap lives in `itc/docs/stations/`; `python -m atomize` opens the station's
@@ -188,21 +206,21 @@ in `tests/test_liveplot_runs.py`.
 
 ## Phase 4 — Spectrometer PC
 
-Linux box, `python3`. Today only `~/sources/Atomize_ITC` is there; plain Atomize and `atomize_sync`
-are not installed and are not needed on the box. Needs about half a day with no experiment planned.
-`~/sources/Atomize_ITC` is not touched, so going back takes a minute.
+Done 2026-11-17, with a venv instead of `pip --user` (see "Resume here"). Old install was Atomize_ITC
+`b07a09d`, already contained in `itc/`. Items left open are marked so.
 
 **A. Record and back up**
 
-- [ ] Close Atomize and all control-center windows.
-- [ ] `cd ~/sources/Atomize_ITC && git status` — commit and push any local edits made on the box.
-- [ ] `pip show atomize-itc` and `which atomize-itc epr-auto` — note how it is installed now.
-- [ ] Reference results: `gui_vs_engine.py` reports ALL PASS (if the harness is on the box); record a
-      standard echo on the usual sample (amplitude, phase, settings).
-- [ ] Compare `PB_Insys_DAC_config.ini` in the repo and in `~/.config/atomize-itc/device_config/`;
-      the repo one is in use today and holds the I/Q tables.
-- [ ] Back up the user configs: `cp -a ~/.config/atomize-itc ~/atomize-itc_config_backup`.
-- [ ] Back up the local files kept inside the repo folder (not in git, or changed at runtime):
+- [x] Close Atomize and all control-center windows (nothing was running).
+- [x] `git status`: local edits were the three runtime `*.param` files and `BH_15.py`
+      `max_set_retries = 1`; the latter became a config key (core `e16ea36`).
+- [x] Old install: editable user-site `atomize-itc` 0.0.0 plus a stale `Atomize.egg-link`, both
+      pointing at `~/sources/Atomize_ITC`; started with the `atom` alias.
+- [ ] Reference results: `gui_vs_engine.py` is not on the box; no standard echo was recorded.
+- [x] `PB_Insys_DAC_config.ini`: the user copy is identical to the repo copy and holds the I/Q tables.
+- [x] Back up the user configs: in `~/sources/old_setup_backup_2026_11_17.tar.gz`.
+- [x] Back up the local files kept inside the repo folder (only `*.param` and `*_lastdir.txt`
+      existed; no presets, `protocols/tuned/`, `protocols/runs/` or Liveplot layout):
 
       ```bash
       cd ~/sources/Atomize_ITC
@@ -215,43 +233,41 @@ are not installed and are not needed on the box. Needs about half a day with no 
 
 **B. Install**
 
-- [ ] `pip uninstall atomize-itc`
-- [ ] `git clone` plain Atomize to `~/sources/Atomize`, then `pip install -e ~/sources/Atomize`.
-- [ ] `git clone` the station repo to `~/sources/Atomize_stations`, then `pip install -e ~/sources/Atomize_stations/itc`.
-- [ ] Copy the I/Q tables (`iq_cal_*`, `rx_cal_*`) into the user copy of `PB_Insys_DAC_config.ini`.
-- [ ] Only if scripts use `calibration = 'True'`: check that `Calibration_curve_08_2024_Sibir_magnet.csv`
-      is in `~/.config/atomize-itc/device_config/`; if not, copy it there from
-      `~/sources/Atomize_ITC/atomize/device_modules/config/`.
-- [ ] Put the local files back: `rsync -a ~/itc_local_backup/ ~/sources/Atomize_stations/itc/`
-- [ ] Desktop launcher and icons: `python3 ~/sources/Atomize_stations/itc/icons/install_desktop.py`
-- [ ] `gui_vs_engine.py` (if on the box): point it at the new presets folder if the old path is written in it.
+- [x] `pip uninstall atomize-itc` (user site), done last, after the operator checks.
+- [x] Core and station cloned from bundles to `~/sources/Atomize` and `~/sources/Atomize_stations`,
+      installed editable into `~/sources/atomize_venv` from wheels.
+- [x] I/Q tables: already in the user copy, nothing to copy.
+- [x] Sibir curve: already in `~/.config/atomize-itc/device_config/`.
+- [x] Local files back: the `*.param` and `*_lastdir.txt` files copied into `itc/`.
+- [x] Desktop launcher and icons, run with the venv's `bin/` first on `PATH`.
+- [x] `gui_vs_engine.py`: not on the box.
 
 **C. Checks without hardware**
 
-- [ ] `atomize-itc` starts with the endstation tab.
-- [ ] `diff -r ~/.config/atomize-itc ~/atomize-itc_config_backup` shows no differences.
-- [ ] A known script passes with Test Scripts ticked.
-- [ ] `epr-auto run protocols/tune_up.yaml --test` passes.
-- [ ] `gui_vs_engine.py` reports ALL PASS (if on the box).
-- [ ] `pytest` passes.
+- [x] `atomize-itc` starts with the endstation tab; `ROOT_DIR` is `itc/`, working folder `itc/libs`.
+- [x] User configs unchanged apart from the intended `max_set_retries = 1`.
+- [x] Test mode from `libs/`: T2, DEER, T1/T2/Rabi vs field, HYSCORE pass.
+- [x] `epr-auto run --test`: all 8 protocols in `protocols/` run every step.
+- [ ] `pytest`: not run on the box (pytest is not in the venv).
 
 **D. Checks with hardware (operator present)**
 
-- [ ] Open each tool once: MW bridge, field, temperature, tune preset, RECT phasing, AWG phasing,
-      CW, TR with its scopes.
-- [ ] The Insys board opens and the standard echo matches the reference from step A.
+- [x] CW, TR and pulsed mode work (operator, 2026-11-17).
+- [ ] Open each remaining tool once: MW bridge, field, temperature, tune preset, RECT phasing,
+      AWG phasing, TR scopes.
+- [ ] The standard echo matches a reference (none was recorded in step A).
 - [ ] Live edit works in the AWG phasing tool.
 - [ ] One short protocol runs live from the launcher.
 
-**Going back**
+**Going back** (not tried)
 
 ```bash
-pip uninstall atomize-itc atomize-py
-pip install -e ~/sources/Atomize_ITC
+cd ~/sources && tar xzf Atomize_ITC_archive_2026_11_17.tar.gz
+python3 -m pip install --user --no-deps --no-index --find-links ~/sources/wheels -e ~/sources/Atomize_ITC
 ```
 
-The user configs are the same folder in both setups, so nothing is lost either way. Copy back any
-`*.param` or preset changed in the meantime.
+Then point the `atom` and `epr` aliases in `~/.bashrc` back at `atomize-itc` and `epr-auto`. The user
+configs are the same folder in both setups; copy back any `*.param` changed in the meantime.
 
 ## Phase 5 — Settle ITC
 
