@@ -18,8 +18,9 @@ on GitHub. Details in Phase 4 below.
   scipy 1.15.3, pyqtgraph 0.14.0). Core and station editable from `~/sources/Atomize` and
   `~/sources/Atomize_stations`, cloned from bundles in `~/sources/bundles`. The linux-gpib binding
   stays in `/usr/local`; `linux_gpib.pth` in the venv points at it.
-- `.bashrc`: `atom` and `epr` start the venv's `atomize-itc` and `epr-auto run`; `atom-pull` pulls
-  the three repos from GitHub (`Atomize_treatment` added 2026-11-18) (`origin` = the public HTTPS URLs; the PC needs a network connection). The desktop launcher points at the venv.
+- `.bashrc`: `atom` and `epr` start the venv's `atomize-itc` and `epr-auto run`; `atom-pull` runs
+  `~/sources/atom-pull.sh` (since 2026-11-18; copy `atom-pull-fel2.sh` next to this file): the
+  three repos from GitHub, or `atom-pull bundles` from `~/sources/bundles` (`origin` = the public HTTPS URLs; the PC needs a network connection). The desktop launcher points at the venv.
 - `~/.config/atomize-itc` is kept as it was, plus `max_set_retries = 1` in `BH_15_config.ini` (the
   box ran with a local code edit before). Device configs changed in a repo must be copied there by hand.
 - The old `~/sources/Atomize_ITC` and its user-site install are removed; the folder is in
@@ -347,9 +348,17 @@ Done 2026-11-17, with a venv instead of `pip --user` (see "Resume here"). Old in
   (`origin` = the GitHub URL). The `.param` edits are kept.
 - Installed into the venv with `pip install --no-index --find-links ~/sources/wheels -e`:
   `atomize-treatment` 0.1.0, then `itc` again (0.6.0); every dependency was already there;
-  `pip check` clean. The `atom-pull` alias now also pulls `~/sources/Atomize_treatment`. It is still
-  a plain `git pull --ff-only` per repo: it does not read bundles or reinstall on a `pyproject.toml`
-  change, unlike itc22's `atom-pull.sh`.
+  `pip check` clean. - `atom-pull` is now `~/sources/atom-pull.sh` (copy: `atom-pull-fel2.sh` next to this file;
+  the old alias, a plain `git pull` of two repos, is in `backup_2026_11_18/bashrc`). Like itc22's:
+  `atom-pull` from GitHub, `atom-pull bundles` or `atom-pull <folder>` from bundles (`SHA256SUMS`
+  checked), fast-forward only, a repo whose `pyproject.toml` changed reinstalled into the venv the
+  same way, a missing repo cloned and installed, refused while Atomize or `epr-auto` runs.
+  Different from itc22's: local edits (the `.param` files the tools write) do not stop the update;
+  they are kept and listed, and a repo is left as it is only when the update changes an edited file.
+  Tested in a scratch copy on the laptop (old heads → fast-forward, treatment cloned and installed,
+  `itc` reinstalled, `.param` edit kept; an edit to a changed file stops that repo; bad checksum;
+  a running protocol) and on the PC from the bundles (all up to date); from GitHub it failed cleanly
+  because the PC was offline, untried online.
 - Checks on the PC: `atomize-itc` starts; in the main window (offscreen, from `itc/libs`) the
   EPR Endstation Control tab shows "Version 0.6.0; 18/11/2026"; the six Analysis buttons have icons
   and each starts its `atomize.treatment` tool, still running after 6 s; a 1D plot (two curves,
