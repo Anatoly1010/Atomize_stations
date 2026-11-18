@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atomize-itc2"
-version = "0.5.0"
+version = "0.6.0"
 authors = [
     {name = "Atomize Developers"}
 ]
@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 
-dependencies = ["atomize-py>=0.5", "pyyaml>=5.4"]
+dependencies = ["atomize-py>=0.5", "atomize-treatment>=0.1", "pyyaml>=5.4"]
 license-files = ["license.md"]
 
 [project.scripts]

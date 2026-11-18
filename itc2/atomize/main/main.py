@@ -38,8 +38,8 @@ class MyExtendedNameList(NameList):
         """
         Hand the selected plot off to the standalone Data Treatment window.
         1D plots (docks with named curves) go to the 1D tool via
-        libs/treatment_buffer.csv; 2D image plots go to the 2D tool via
-        libs/treatment_buffer_2d.npz. Either way this is the cross-process
+        treatment_buffer.csv; 2D image plots go to the 2D tool via
+        treatment_buffer_2d.npz. Either way this is the cross-process
         bridge the standalone windows read (they cannot see the main window's
         in-memory plots directly); they pick it up with "Load from plot".
         """
@@ -108,7 +108,7 @@ class MyExtendedNameList(NameList):
         except Exception:
             xname = ''
 
-        buffer_path = os.path.join(self.window.path_to_main, 'treatment_buffer.csv')
+        from atomize.treatment.paths import BUFFER_PATH as buffer_path
         header = 'Atomize data treatment buffer\nlabels: ' + '|'.join(labels)
         if any(colors):
             header += '\ncolors: ' + '|'.join(colors)
@@ -122,7 +122,7 @@ class MyExtendedNameList(NameList):
 
     def _send_2d_to_treatment(self, name, dock):
         """Dump the selected 2D image (and its axis geometry) to
-        libs/treatment_buffer_2d.npz for the 2D Data Treatment window. The
+        treatment_buffer_2d.npz for the 2D Data Treatment window. The
         image stack is (frames, nX, nY); frame 0 = real/I, frame 1 = imag/Q.
         We transpose each frame back to the tool's [trace, point] layout."""
         full = getattr(dock.img_view, 'image', None)
@@ -153,7 +153,7 @@ class MyExtendedNameList(NameList):
         except Exception:
             ynm, ysc = 'Y', ''
 
-        buffer_path = os.path.join(self.window.path_to_main, 'treatment_buffer_2d.npz')
+        from atomize.treatment.paths import BUFFER_2D_PATH as buffer_path
         np.savez(buffer_path, i=i, q=q,
                  geom=np.array([x0, dx, y0, dy], dtype=float),
                  labels=np.array([str(xnm), str(xsc), str(ynm), str(ysc)]))
@@ -451,6 +451,11 @@ class MainExtended(MainWindow):
         grid = QGridLayout()
         grid.setSpacing(16)
         icon_dir = Path(__file__).resolve().parents[1] / 'control_center' / 'gui'
+        try:
+            import atomize.treatment
+            treat_icon_dir = Path(atomize.treatment.__file__).resolve().parent / 'gui'
+        except ImportError:
+            treat_icon_dir = icon_dir
         for column, (heading, actions) in enumerate(groups):
             panel = QWidget()
             panel.setObjectName("launcherPanel")
@@ -465,7 +470,10 @@ class MainExtended(MainWindow):
                 button = QPushButton(name)
                 button.setMinimumSize(208, 42)
                 button.setStyleSheet(REFINED_STYLES['BUTTON_STYLE'] + "QPushButton { text-align: left; padding-left: 12px; }")
-                button.setIcon(QtGui.QIcon(str(icon_dir / f'icon_{icon_name}.ico')))
+                icon = icon_dir / f'icon_{icon_name}.ico'
+                if not icon.is_file():
+                    icon = treat_icon_dir / f'icon_{icon_name}.ico'
+                button.setIcon(QtGui.QIcon(str(icon)))
                 button.setIconSize(QtCore.QSize(25, 25))
                 button.clicked.connect(callback)
                 layout.addWidget(button)
@@ -485,7 +493,7 @@ class MainExtended(MainWindow):
         self.protocol_launcher.options_layout.addWidget(self.checkTests)
         main_layout.addStretch()
 
-        bottom_label = QLabel("Version 0.5.0; 17/11/2026")
+        bottom_label = QLabel("Version 0.6.0; 18/11/2026")
         bottom_label.setStyleSheet(REFINED_STYLES['HINT_STYLE'])
         main_layout.addWidget(bottom_label)
 
@@ -678,21 +686,21 @@ class MainExtended(MainWindow):
         """
         A function to run the EPR sequence timing & phase-cycling calculator.
         """
-        self.process_sequence_calc.setArguments([os.path.join('..','atomize/control_center/sequence_calculator.py')])
+        self.process_sequence_calc.setArguments(['-m', 'atomize.treatment.sequence_calculator'])
         self.process_sequence_calc.start()
 
     def start_excitation_profile(self):
         """
         A function to run the pulse excitation/inversion profile simulator.
         """
-        self.process_excitation.setArguments([os.path.join('..','atomize/control_center/excitation_profile.py')])
+        self.process_excitation.setArguments(['-m', 'atomize.treatment.excitation_profile'])
         self.process_excitation.start()
 
     def start_spin_sim(self):
         """
         A function to run the density-matrix pulse-sequence simulator.
         """
-        self.process_spin_sim.setArguments([os.path.join('..','atomize/control_center/spin_dynamics_sim.py')])
+        self.process_spin_sim.setArguments(['-m', 'atomize.treatment.spin_dynamics_sim'])
         self.process_spin_sim.start()
 
     def start_tune_preset(self):
@@ -720,7 +728,7 @@ class MainExtended(MainWindow):
         """
         A function to run the data-treatment window (fitting / FFT / smoothing).
         """
-        self.process_treatment.setArguments([os.path.join('..','atomize/control_center/data_treatment.py')])
+        self.process_treatment.setArguments(['-m', 'atomize.treatment.data_treatment'])
         self.process_treatment.start()
 
     def start_treatment_2d_control(self):
@@ -728,7 +736,7 @@ class MainExtended(MainWindow):
         A function to run the 2D data-treatment window (FFT along an axis /
         2D FFT / slice / projection).
         """
-        self.process_treatment_2d.setArguments([os.path.join('..','atomize/control_center/data_treatment_2d.py')])
+        self.process_treatment_2d.setArguments(['-m', 'atomize.treatment.data_treatment_2d'])
         self.process_treatment_2d.start()
 
     def start_deer_analysis(self):
@@ -736,7 +744,7 @@ class MainExtended(MainWindow):
         A function to run the standalone DEER / PDS analysis window
         (background fit + Tikhonov inversion to a distance distribution P(r)).
         """
-        self.process_deer.setArguments([os.path.join('..','atomize/control_center/deer_analysis.py')])
+        self.process_deer.setArguments(['-m', 'atomize.treatment.deer_analysis'])
         self.process_deer.start()
 
     def start_field_control(self):

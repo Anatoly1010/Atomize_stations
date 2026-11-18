@@ -44,9 +44,8 @@ Watch out until Phase 4 and Phase 5:
 - The Sibir calibration curve is optional. `ITC_FC.py` opens it only for
   `magnet_field(field, calibration = 'True')`, which no tool or script uses today, and then reads it
   from `~/.config/<app name>/device_config/`; a setup without the file gets a clear error.
-- `sync_check.py --sync-cc` still mirrors the shared control-center tools from `Atomize_ITC`, while
-  the laptop runs `Atomize_stations/itc`. Edits to those tools must go into `Atomize_ITC` too until
-  Phase 5 moves the lead to the station.
+- The shared data treatment tools now live in `Atomize_treatment` (see below). Do not run
+  `sync_check.py --sync-cc` any more: NIOCH and NIOCH_Q keep their copies until they move.
 
 How `itc/` was built: every `Atomize_ITC` file that plain does not have or that differs from
 plain's, plus `tests/conftest.py`, `license.md` and the whole `icons/` folder, minus `__main__.py`, `pyproject.toml`,
@@ -84,7 +83,8 @@ above must stay).
 Next, in order:
 
 1. Push `Atomize` `e16ea36` and `Atomize_stations` `c67f565`.
-2. Phase 5: a week of normal use; the hardware checks left open in Phase 4 D.
+2. Install `Atomize_treatment` on the ITC and ITC2 PCs (see below).
+3. Phase 5: a week of normal use; the hardware checks left open in Phase 4 D.
 
 Decisions made: station repo `Atomize_stations`, fresh history, branch `main`; `atomize-itc`
 starts at 0.5.0; this roadmap lives in `itc/docs/stations/`; `python -m atomize` opens the station's
@@ -112,6 +112,43 @@ from wheels (6.4.2 kept in `~/sources/wheels/qt642`), pyqtgraph stays 0.13.1; co
 `pytest` pass there. `~/.config/atomize-itc` copied to `~/.config/atomize-itc2`; desktop launcher
 installed. The old setup (`~/Atomize`, `~/Atomize_ITC`, the backups, `~/pyqtgragh`) is archived in
 `~/sources/old_setup_backup_2026_11_16.tar.gz`; `~/Atomize_ITC` is untouched.
+
+## Data treatment tools: `Atomize_treatment` (2026-11-18)
+
+The seven shared tools (`data_treatment`, `data_treatment_2d`, `deer_analysis`, `header_view`,
+`excitation_profile`, `sequence_calculator`, `spin_dynamics_sim`), their icons and the Makie renderer
+moved to the separate repo `Atomize_treatment` (package `atomize-treatment` 0.1.0,
+`https://github.com/Anatoly1010/Atomize_treatment`). The core stays without them; a station lists the
+package as a dependency. Like a station, it joins the core's `atomize` name, as `atomize/treatment/`.
+
+Changed against the station copies:
+
+- The plot buffers moved from `libs/` to `<user config>/treatment/`, the last-used folders to
+  `<user config>/lastdir/` (`atomize/treatment/paths.py`); the tools' remembered folders reset once.
+- `sequence_calculator`: the default grid comes from `seqcalc_grid` in the station's `station.py`,
+  3.2 ns without it (NIOCH needs 2.0, NIOCH_Q 4.0 when they move).
+- `spin_dynamics_sim` opens the station's `control_center/experiments/` when there is one.
+- The Makie renderer is in `atomize/treatment/makie/` (was the station's `script_examples/makie/`).
+- Commands `atomize-treatment`, `atomize-treatment-2d`, `atomize-deer`, `atomize-seqcalc`,
+  `atomize-excitation`, `atomize-spin-sim` start the tools without the main window.
+
+`itc/` and `itc2/` 0.6.0: the main window starts the tools with `python -m atomize.treatment.<tool>`,
+takes their button icons from the package, and "Send to Data Treatment" writes the buffers named in
+`atomize.treatment.paths`; the station copies are removed; new dependency `atomize-treatment>=0.1`.
+
+Checks on the laptop: all six tools open with only the core installed and with the ITC station;
+they start from the main window buttons, all with icons; a 1D and a 2D plot sent with the station's
+code arrive in the tools; the sequence calculator self-test passes; station `pytest` 200 passed for
+`itc/` and `itc2/`, core `pytest` 187 passed.
+
+On the spectrometer PCs, together with the next pull (without it the treatment buttons fail, the
+rest works): clone `Atomize_treatment` from a bundle into `~/sources/`, install it editable the
+way the station is installed there (fel2: into `~/sources/atomize_venv`; itc22: `--user --no-deps`),
+with `--no-index --find-links ~/sources/wheels`, then reinstall the station the same way (0.6.0).
+Add the repo to `atom-pull` on fel2.
+
+NIOCH and NIOCH_Q keep their own copies (last mirrored from `Atomize_ITC`); edits made in
+`Atomize_treatment` reach them when they move into `Atomize_stations` (Phase 6).
 
 ## Goal
 
@@ -273,8 +310,8 @@ configs are the same folder in both setups; copy back any `*.param` changed in t
 
 - [ ] One week of normal use on the new setup.
 - [ ] Repeat the install on the Windows development machine (`python`, test mode only).
-- [ ] `sync_check.py` (development machine): ITC leaves the list of forks; it stays the source for the shared
-      control-center tools of NIOCH and NIOCH_Q, read from `Atomize_stations/itc/`.
+- [ ] `sync_check.py` (development machine): ITC leaves the list of forks; `--sync-cc` goes, since
+      the shared tools now live in `Atomize_treatment`.
 - [ ] Archive `Atomize_ITC` on GitHub (read-only) with a readme line pointing to the new repo.
 - [ ] Update install instructions in `atomize_docs` where they mention the ITC repo.
 
