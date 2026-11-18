@@ -83,7 +83,7 @@ above must stay).
 Next, in order:
 
 1. Push `Atomize` `e16ea36` and `Atomize_stations` `c67f565`.
-2. Install `Atomize_treatment` on the ITC and ITC2 PCs (see below).
+2. Install `Atomize_treatment` on the ITC PC (see below); the ITC2 PC is done (2026-11-18).
 3. Phase 5: a week of normal use; the hardware checks left open in Phase 4 D.
 
 Decisions made: station repo `Atomize_stations`, fresh history, branch `main`; `atomize-itc`
@@ -112,6 +112,24 @@ from wheels (6.4.2 kept in `~/sources/wheels/qt642`), pyqtgraph stays 0.13.1; co
 `pytest` pass there. `~/.config/atomize-itc` copied to `~/.config/atomize-itc2`; desktop launcher
 installed. The old setup (`~/Atomize`, `~/Atomize_ITC`, the backups, `~/pyqtgragh`) is archived in
 `~/sources/old_setup_backup_2026_11_16.tar.gz`; `~/Atomize_ITC` is untouched.
+
+Update on 2026-11-18 (to itc2 0.6.0 with `Atomize_treatment`): before, the PC had `Atomize`
+`01d00a7` and `Atomize_stations` `9d7cfb1`, both clean (`atomize-py` 0.5.0, `atomize-itc2` 0.5.0).
+Backups in `~/sources/backup_2026_11_18/`: the state, the ignored files of `itc2/` (`*.param`,
+`libs/*lastdir.txt`, `liveplot_layout.txt`), `~/.config/atomize-itc2` and the desktop launchers.
+Full bundles of the three repos are in `~/sources/bundles/` (with `SHA256SUMS`); `Atomize` and
+`Atomize_stations` fast-forwarded from them to `a219ec8` and `766aadf` (the PC's `origin/main` was a
+stale ref to `183f666`, an earlier version of the ITC2 commit, and was reset to the bundle's `main`),
+`Atomize_treatment` `9e768eb` cloned into `~/sources/` (`origin` = the GitHub URL). Installed with
+`python3 -m pip install --user --no-deps --no-index --find-links ~/sources/wheels -e`:
+`atomize-treatment` 0.1.0, then `itc2` again (0.6.0); h5py, platformdirs and scipy were already
+there, Julia is not (the Makie renderer stays unavailable, as before). Checks on the PC: core
+`pytest tests` 188 passed, 4 skipped; station `pytest tests` 200 passed; `atomize-itc2` starts; in the
+main window (offscreen) the tab shows "Version 0.6.0", the six Analysis buttons have icons and each
+starts its `atomize.treatment` tool; a 1D (two curves) and a 2D plot sent by a script through
+LivePlot reach Data Treatment and Data Treatment 2D with "Send to Data Treatment", with their axes.
+The buffers are in `~/.config/atomize-itc2/treatment/`; the user config is otherwise unchanged.
+`atomize_docs` is not on this PC.
 
 ## Data treatment tools: `Atomize_treatment` (2026-11-18)
 
@@ -145,7 +163,7 @@ On the spectrometer PCs, together with the next pull (without it the treatment b
 rest works): clone `Atomize_treatment` from a bundle into `~/sources/`, install it editable the
 way the station is installed there (fel2: into `~/sources/atomize_venv`; itc22: `--user --no-deps`),
 with `--no-index --find-links ~/sources/wheels`, then reinstall the station the same way (0.6.0).
-Add the repo to `atom-pull` on fel2.
+Add the repo to `atom-pull` on fel2. Done on itc22 on 2026-11-18 (see ITC2 station); fel2 is next.
 
 NIOCH and NIOCH_Q keep their own copies (last mirrored from `Atomize_ITC`); edits made in
 `Atomize_treatment` reach them when they move into `Atomize_stations` (Phase 6).
