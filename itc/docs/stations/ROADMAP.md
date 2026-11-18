@@ -98,7 +98,8 @@ from `docs/stations/ROADMAP.md`, Resume here."
 
 ## ITC2 station (2026-11-16)
 
-`itc2/` is the CW/TR EPR spectrometer on the PC `itc22` (`itc22@192.168.2.20`, no internet). It was
+`itc2/` is the CW/TR EPR spectrometer on the PC `itc22` (`itc22@192.168.2.20`, offline in normal use;
+it can be connected to the internet for updates). It was
 built from `itc/` plus what that PC ran from `~/Atomize_ITC` (branch `cw-setup`, `4ac0277`, local
 commits on top of `f4578be`): its `cw_control.py` (SR-830, ITC_FC, this setup's BDPA and NMR
 numbers), its `config.ini`, `ITC_FC_config.ini` and `SR_830_config.ini`. App name and command
@@ -130,6 +131,20 @@ starts its `atomize.treatment` tool; a 1D (two curves) and a 2D plot sent by a s
 LivePlot reach Data Treatment and Data Treatment 2D with "Send to Data Treatment", with their axes.
 The buffers are in `~/.config/atomize-itc2/treatment/`; the user config is otherwise unchanged.
 `atomize_docs` is not on this PC.
+
+Updates from then on: `atom-pull` (alias in `~/.bashrc`, runs `~/sources/atom-pull.sh`; a copy is
+`atom-pull-itc22.sh` next to this file). With the PC on the internet, `atom-pull` fetches `Atomize`
+(`master`), `Atomize_treatment` and `Atomize_stations` (`main`) from GitHub; offline, `atom-pull
+bundles` takes `<repo>.bundle` from `~/sources/bundles` (`atom-pull <folder>` from another folder),
+made on the laptop with `git bundle create <repo>.bundle --all` (an optional `SHA256SUMS` there is
+checked). Only fast-forwards; a repo with local edits or commits is left alone and reported. A repo
+whose `pyproject.toml` changed (`itc2/pyproject.toml` for the station) is reinstalled with the same
+`pip --user --no-deps --no-index --find-links ~/sources/wheels -e`; a missing repo is cloned and
+installed. It refuses to run while Atomize is open. Tested from the bundles on the PC (all up to date)
+and in a scratch copy on the laptop (old heads → fast-forward, treatment cloned and installed, itc2
+reinstalled, a local edit stops the update); the GitHub path failed cleanly because the PC was offline,
+and is untried online. Push to GitHub before an online `atom-pull`. The old `~/.bashrc` is in
+`~/sources/backup_2026_11_18/bashrc`. `atom` on this PC is not Atomize (`fsc at`).
 
 ## Data treatment tools: `Atomize_treatment` (2026-11-18)
 
@@ -163,7 +178,8 @@ On the spectrometer PCs, together with the next pull (without it the treatment b
 rest works): clone `Atomize_treatment` from a bundle into `~/sources/`, install it editable the
 way the station is installed there (fel2: into `~/sources/atomize_venv`; itc22: `--user --no-deps`),
 with `--no-index --find-links ~/sources/wheels`, then reinstall the station the same way (0.6.0).
-Add the repo to `atom-pull` on fel2. Done on itc22 on 2026-11-18 (see ITC2 station); fel2 is next.
+Add the repo to `atom-pull` on fel2. Done on itc22 on 2026-11-18, where `atom-pull` is new and also
+reads bundles (see ITC2 station); fel2 is next.
 
 NIOCH and NIOCH_Q keep their own copies (last mirrored from `Atomize_ITC`); edits made in
 `Atomize_treatment` reach them when they move into `Atomize_stations` (Phase 6).
