@@ -8,7 +8,7 @@ from `Atomize_ITC/docs/stations/`.
 State on 2026-11-17: the spectrometer PC (`fel2@192.168.2.1`, Ubuntu 22.04, Python 3.10, no internet)
 runs the new setup; CW, TR and pulsed mode work. Core `Atomize` `e16ea36` (BH_15 `max_set_retries`
 read from the config) and `Atomize_stations` `c67f565` (CW defaults 10 ms / 50 mV) are on the PC and
-not yet pushed. Details in Phase 4 below.
+on GitHub. Details in Phase 4 below.
 
 - Install: venv `~/sources/atomize_venv`, created `--without-pip` (the box has no `python3-venv`);
   pip, build tools and all packages from wheels in `~/sources/wheels` (PyQt6 6.12.1, numpy 2.2.6,
@@ -82,9 +82,8 @@ above must stay).
 
 Next, in order:
 
-1. Push `Atomize` `e16ea36` and `Atomize_stations` `c67f565`.
-2. Install `Atomize_treatment` on the ITC PC (see below); the ITC2 PC is done (2026-11-18).
-3. Phase 5: a week of normal use; the hardware checks left open in Phase 4 D.
+1. Install `Atomize_treatment` on the ITC PC (see below); the ITC2 PC is done (2026-11-18).
+2. Phase 5: a week of normal use; the hardware checks left open in Phase 4 D.
 
 Decisions made: station repo `Atomize_stations`, fresh history, branch `main`; `atomize-itc`
 starts at 0.5.0; this roadmap lives in `itc/docs/stations/`; `python -m atomize` opens the station's
