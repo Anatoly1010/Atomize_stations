@@ -1,9 +1,12 @@
 # Two repos instead of five — roadmap
 
-Created 2026-11-15. Status: Phases 1 to 4 done (spectrometer PC on 2026-11-17); Phase 5 is next. This file moved here
+Created 2026-11-15. Status: Phases 1 to 4 done (spectrometer PC on 2026-11-17, updated to itc 0.6.0 on 2026-11-18); Phase 5 is next. This file moved here
 from `Atomize_ITC/docs/stations/`.
 
 ## Resume here
+
+State on 2026-11-18: the spectrometer PC runs itc 0.6.0 with `Atomize_treatment` 0.1.0 (core
+`a219ec8`, stations `4306762`, treatment `9e768eb`); see "Update to itc 0.6.0" in Phase 4.
 
 State on 2026-11-17: the spectrometer PC (`fel2@192.168.2.1`, Ubuntu 22.04, Python 3.10, no internet)
 runs the new setup; CW, TR and pulsed mode work. Core `Atomize` `e16ea36` (BH_15 `max_set_retries`
@@ -16,7 +19,7 @@ on GitHub. Details in Phase 4 below.
   `~/sources/Atomize_stations`, cloned from bundles in `~/sources/bundles`. The linux-gpib binding
   stays in `/usr/local`; `linux_gpib.pth` in the venv points at it.
 - `.bashrc`: `atom` and `epr` start the venv's `atomize-itc` and `epr-auto run`; `atom-pull` pulls
-  both repos from GitHub (`origin` = the public HTTPS URLs; the PC needs a network connection). The desktop launcher points at the venv.
+  the three repos from GitHub (`Atomize_treatment` added 2026-11-18) (`origin` = the public HTTPS URLs; the PC needs a network connection). The desktop launcher points at the venv.
 - `~/.config/atomize-itc` is kept as it was, plus `max_set_retries = 1` in `BH_15_config.ini` (the
   box ran with a local code edit before). Device configs changed in a repo must be copied there by hand.
 - The old `~/sources/Atomize_ITC` and its user-site install are removed; the folder is in
@@ -82,8 +85,7 @@ above must stay).
 
 Next, in order:
 
-1. Install `Atomize_treatment` on the ITC PC (see below); the ITC2 PC is done (2026-11-18).
-2. Phase 5: a week of normal use; the hardware checks left open in Phase 4 D.
+1. Phase 5: a week of normal use; the hardware checks left open in Phase 4 D.
 
 Decisions made: station repo `Atomize_stations`, fresh history, branch `main`; `atomize-itc`
 starts at 0.5.0; this roadmap lives in `itc/docs/stations/`; `python -m atomize` opens the station's
@@ -178,7 +180,7 @@ rest works): clone `Atomize_treatment` from a bundle into `~/sources/`, install 
 way the station is installed there (fel2: into `~/sources/atomize_venv`; itc22: `--user --no-deps`),
 with `--no-index --find-links ~/sources/wheels`, then reinstall the station the same way (0.6.0).
 Add the repo to `atom-pull` on fel2. Done on itc22 on 2026-11-18, where `atom-pull` is new and also
-reads bundles (see ITC2 station); fel2 is next.
+reads bundles (see ITC2 station), and on fel2 the same day (Phase 4, "Update to itc 0.6.0").
 
 NIOCH and NIOCH_Q keep their own copies (last mirrored from `Atomize_ITC`); edits made in
 `Atomize_treatment` reach them when they move into `Atomize_stations` (Phase 6).
@@ -328,6 +330,44 @@ Done 2026-11-17, with a venv instead of `pip --user` (see "Resume here"). Old in
 - [ ] The standard echo matches a reference (none was recorded in step A).
 - [ ] Live edit works in the AWG phasing tool.
 - [ ] One short protocol runs live from the launcher.
+
+**Update to itc 0.6.0 with `Atomize_treatment` (2026-11-18)**
+
+- Before: `Atomize` `e16ea36`, `Atomize_stations` `467aad0`, both fast-forwardable;
+  `atomize-py` 0.5.0 and `atomize-itc` 0.5.0 in the venv. Local edits: `bridge.param`,
+  `digitizer_insys.param`, `field.param` and `libs/exam_adc.ini` (`streamBufSizeKb` auto-adjusted to
+  128; set back to the repo's 1024 as the user asked). Atomize was not running.
+- Backups in `~/sources/backup_2026_11_18/`: `state.txt` (heads, status, `pip list`), the
+  local diff, the local and ignored files of the repo (`*.param`, `libs/*_lastdir.txt`,
+  `exam_adc.ini`), `~/.config/atomize-itc`, `.bashrc` and the desktop entries.
+- The PC was offline (no DNS for github.com), so full bundles of the three repos went to
+  `~/sources/bundles/` (with `SHA256SUMS`); the 2026-11-17 bundles are in `bundles/2026_11_17/`.
+  `Atomize` and `Atomize_stations` fast-forwarded from them to `a219ec8` and `4306762` (`origin/*`
+  set to the bundle's branch); `Atomize_treatment` `9e768eb` cloned into `~/sources/`
+  (`origin` = the GitHub URL). The `.param` edits are kept.
+- Installed into the venv with `pip install --no-index --find-links ~/sources/wheels -e`:
+  `atomize-treatment` 0.1.0, then `itc` again (0.6.0); every dependency was already there;
+  `pip check` clean. The `atom-pull` alias now also pulls `~/sources/Atomize_treatment`. It is still
+  a plain `git pull --ff-only` per repo: it does not read bundles or reinstall on a `pyproject.toml`
+  change, unlike itc22's `atom-pull.sh`.
+- Checks on the PC: `atomize-itc` starts; in the main window (offscreen, from `itc/libs`) the
+  EPR Endstation Control tab shows "Version 0.6.0; 18/11/2026"; the six Analysis buttons have icons
+  and each starts its `atomize.treatment` tool, still running after 6 s; a 1D plot (two curves,
+  axis "Time (s)") and a 2D plot (axes Time s / Field G, its start and step) sent by a script through
+  LivePlot reach Data Treatment and Data Treatment 2D with "Send to Data Treatment" (the tools
+  read and consume the buffers); `~/.config/atomize-itc` unchanged apart from the new
+  `treatment/` folder, `max_set_retries = 1` still in `BH_15_config.ini`; `epr-auto run --test`:
+  all 8 protocols in `protocols/` run every step. `pytest` is still not in the venv.
+- The six `atomize-<tool>.desktop` icon entries for the treatment tools are `Exec=false` (icons
+  only) and stay as they were; `itc/icons` did not change.
+- Seen on the PC: `main_config.ini` still names `~/sources/Atomize_ITC/atomize/script_examples`
+  as the scripts folder, which was archived on 2026-11-17 (left as it is). The operator used Atomize
+  from the desktop launcher during the update (a session closed at 14:48, after the install); the
+GUI check and the protocol tests were repeated with Atomize closed, same results. That session wrote
+`digitizer_insys.param` back to the repo's version (the old one is in the backup).
+- Back to 0.5.0 (not tried): `git -C ~/sources/Atomize reset --hard e16ea36`,
+  `git -C ~/sources/Atomize_stations reset --hard 467aad0` (commit or stash the `.param` edits
+  first), reinstall `itc` the same way, `pip uninstall atomize-treatment`, `.bashrc` from the backup.
 
 **Going back** (not tried)
 
